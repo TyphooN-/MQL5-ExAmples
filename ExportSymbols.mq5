@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.000"
+#property version     "1.001"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -51,7 +51,7 @@ void ExportSymbolsToCSV()
       return;
    }
    // Write the header row
-   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions,VaR_1_Lot");
+   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions,VaR_1_Lot,BidPrice,AskPrice");
    // Get the total number of symbols
    int total_symbols = SymbolsTotal(false);
    // Loop through all symbols and write their details to the CSV file
@@ -93,13 +93,16 @@ void ExportSymbolsToCSV()
          {
             var_1_lot = portfolioRiskMan.SinglePositionVaR;
          }
+         // Get bid and ask prices
+         double bid_price = SymbolInfoDouble(symbol, SYMBOL_BID);
+         double ask_price = SymbolInfoDouble(symbol, SYMBOL_ASK);
          // Write symbol details and VaR to the CSV file
          FileWrite(file_handle, 
                    symbol, base_currency, quote_currency, description, digits, point, spread, 
                    tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode, 
                    volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance, 
                    margin_hedged, margin_currency, start_date, expiration_date, 
-                   swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot);
+                   swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot, bid_price, ask_price);
       }
    }
    // Close the CSV file
