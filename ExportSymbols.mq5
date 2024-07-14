@@ -1,6 +1,36 @@
+/**=        ExportSymbols.mq5  (TyphooN's CSV Symbol Exporter)
+ *               Copyright 2023, TyphooN (https://www.marketwizardry.org/)
+ *
+ * Disclaimer and Licence
+ *
+ * This file is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * All trading involves risk. You should have received the risk warnings
+ * and terms of use in the README.MD file distributed with this software.
+ * See the README.MD file for more information and before using this software.
+ *
+ **/
+#property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
+#property link        "https://www.marketwizardry.info"
+#property version     "1.000"
+#property description "TyphooN's CSV Symbol Exporter"
 #property strict
+#include <Darwinex\DWEX Portfolio Risk Man.mqh>
 // Input parameter for the output CSV file path
 input string CSVFilePath = "SymbolsList.csv";
+// Instantiate the portfolio risk manager
+CPortfolioRiskMan portfolioRiskMan(PERIOD_D1, 20);  // Example: Using daily timeframe and 20 periods for StdDev
 // Indicator initialization function
 int OnInit()
 {
@@ -21,7 +51,7 @@ void ExportSymbolsToCSV()
       return;
    }
    // Write the header row
-   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions");
+   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions,VaR_1_Lot");
    // Get the total number of symbols
    int total_symbols = SymbolsTotal(false);
    // Loop through all symbols and write their details to the CSV file
@@ -35,7 +65,7 @@ void ExportSymbolsToCSV()
          string description = SymbolInfoString(symbol, SYMBOL_DESCRIPTION);
          int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-         int spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+         int spread = (int)SymbolInfoInteger(symbol, SYMBOL_SPREAD);
          double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
          double tick_value = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
          double trade_contract_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
@@ -57,13 +87,19 @@ void ExportSymbolsToCSV()
          int swap_type = (int)SymbolInfoInteger(symbol, SYMBOL_SWAP_MODE);
          int swap_3days = (int)SymbolInfoInteger(symbol, SYMBOL_SWAP_ROLLOVER3DAYS);
          string trade_sessions = GetTradeSessions(symbol);
-         // Write symbol details to the CSV file
+         // Calculate VaR for 1 lot
+         double var_1_lot = 0.0;
+         if(portfolioRiskMan.CalculateVaR(symbol, 1.0))
+         {
+            var_1_lot = portfolioRiskMan.SinglePositionVaR;
+         }
+         // Write symbol details and VaR to the CSV file
          FileWrite(file_handle, 
                    symbol, base_currency, quote_currency, description, digits, point, spread, 
                    tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode, 
                    volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance, 
                    margin_hedged, margin_currency, start_date, expiration_date, 
-                   swap_long, swap_short, swap_type, swap_3days, trade_sessions);
+                   swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot);
       }
    }
    // Close the CSV file
@@ -83,22 +119,10 @@ string GetTradeSessions(string symbol)
          {
             if(open_time != 0 && close_time != 0)
             {
-               result += StringFormat("%d-%d:%s-%s;", day, session, TimeToString(open_time, TIME_MINUTES), TimeToString(close_time, TIME_MINUTES));
+               result += StringFormat("%s-%s ", TimeToString(open_time, TIME_MINUTES), TimeToString(close_time, TIME_MINUTES));
             }
          }
       }
    }
    return result;
-}
-// Indicator deinitialization function
-void OnDeinit(const int reason)
-{
-}
-// Indicator calculation function (not used in this script)
-int OnCalculate(const int rates_total, const int prev_calculated, const datetime &time[],
-                const double &open[], const double &high[], const double &low[], const double &close[],
-                const long &tick_volume[], const long &volume[], const int &spread[])
-{
-   // No calculations needed for this script
-   return(rates_total);
 }
