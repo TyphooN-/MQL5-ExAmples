@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.005"
+#property version     "1.006"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -51,7 +51,7 @@ void ExportSymbolsToCSV()
       return;
    }
    // Write the header row with semicolon as the delimiter
-   FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginRate;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName,IndustryName");
+   FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginRate;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName;IndustryName\n");
    // Get the total number of symbols
    int total_symbols = SymbolsTotal(false);
    
@@ -101,7 +101,7 @@ void ExportSymbolsToCSV()
          string sector_name = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
          string industry_name = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
          // Create a line with semicolon as the delimiter
-         string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%f;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s\n",
+         string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%f;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s;%s\n",
                                     symbol, base_currency, quote_currency, description, digits, point, spread,
                                     tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode,
                                     volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance,
