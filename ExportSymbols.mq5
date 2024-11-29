@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.004"
+#property version     "1.005"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -100,20 +100,23 @@ void ExportSymbolsToCSV()
          // Get sector and industry names
          string sector_name = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
          string industry_name = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
-         
-         // Write symbol details and VaR to the CSV file
-         FileWrite(file_handle, 
-                   symbol, base_currency, quote_currency, description, digits, point, spread, 
-                   tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode, 
-                   volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance, 
-                   margin_hedged, margin_currency, start_date, expiration_date, 
-                   swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot, bid_price, ask_price,
-                   sector_name, industry_name);
+         // Create a line with semicolon as the delimiter
+         string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%f;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s\n",
+                                    symbol, base_currency, quote_currency, description, digits, point, spread,
+                                    tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode,
+                                    volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance,
+                                    margin_hedged, margin_currency, TimeToString(start_date, TIME_DATE|TIME_MINUTES), TimeToString(expiration_date, TIME_DATE|TIME_MINUTES),
+                                    swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot, bid_price, ask_price, sector_name, industry_name);
+         // Write the line to the CSV file
+         FileWriteString(file_handle, line);
       }
    }
    // Close the CSV file
    FileClose(file_handle);
    Print("Export completed. File saved at: ", CSVFilePath);
+   // Remove the EA from the chart
+   Print("ExportSymbols EA removed from chart.");
+   ExpertRemove();
 }
 // Function to get the trade session information as a formatted string
 string GetTradeSessions(string symbol)
