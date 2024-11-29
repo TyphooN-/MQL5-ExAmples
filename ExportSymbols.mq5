@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.003"
+#property version     "1.004"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -50,9 +50,8 @@ void ExportSymbolsToCSV()
       Print("Failed to open file: ", CSVFilePath);
       return;
    }
-   // Write the header row
-   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions,VaR_1_Lot,BidPrice,AskPrice,SectorName,IndustryName");
-   
+   // Write the header row with semicolon as the delimiter
+   FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginRate;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName,IndustryName");
    // Get the total number of symbols
    int total_symbols = SymbolsTotal(false);
    
