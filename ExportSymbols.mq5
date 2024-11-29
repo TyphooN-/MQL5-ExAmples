@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.002"
+#property version     "1.003"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -36,9 +36,11 @@ int OnInit()
 {
    // Call the function to export symbols to CSV
    ExportSymbolsToCSV();
+   
    // Terminate the indicator after initialization
    return(INIT_SUCCEEDED);
 }
+// Function to export symbols to CSV
 void ExportSymbolsToCSV()
 {
    // Open the CSV file for writing
@@ -48,10 +50,12 @@ void ExportSymbolsToCSV()
       Print("Failed to open file: ", CSVFilePath);
       return;
    }
-   // Write the header row with semicolon as the delimiter
-   FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginRate;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;Sector;Industry\n");
+   // Write the header row
+   FileWrite(file_handle, "Symbol,BaseCurrency,QuoteCurrency,Description,Digits,Point,Spread,TickSize,TickValue,TradeContractSize,TradeMode,TradeExecutionMode,VolumeMin,VolumeMax,VolumeStep,MarginInitial,MarginMaintenance,MarginHedged,MarginRate,MarginCurrency,StartDate,ExpirationDate,SwapLong,SwapShort,SwapType,Swap3Days,TradeSessions,VaR_1_Lot,BidPrice,AskPrice,SectorName,IndustryName");
+   
    // Get the total number of symbols
    int total_symbols = SymbolsTotal(false);
+   
    // Loop through all symbols and write their details to the CSV file
    for(int i = 0; i < total_symbols; i++)
    {
@@ -94,28 +98,25 @@ void ExportSymbolsToCSV()
          // Get bid and ask prices
          double bid_price = SymbolInfoDouble(symbol, SYMBOL_BID);
          double ask_price = SymbolInfoDouble(symbol, SYMBOL_ASK);
-         // Get sector and industry
-         string sector = GetSector(symbol);
-         string industry = GetIndustry(symbol);
-         // Create a line with semicolon as the delimiter
-         string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%f;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s\n",
-                                    symbol, base_currency, quote_currency, description, digits, point, spread, 
-                                    tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode, 
-                                    volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance, 
-                                    margin_hedged, margin_currency, TimeToString(start_date, TIME_DATE|TIME_MINUTES), TimeToString(expiration_date, TIME_DATE|TIME_MINUTES), 
-                                    swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot, bid_price, ask_price, sector, industry);
+         // Get sector and industry names
+         string sector_name = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
+         string industry_name = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
          
-         // Write the line to the CSV file
-         FileWriteString(file_handle, line);
+         // Write symbol details and VaR to the CSV file
+         FileWrite(file_handle, 
+                   symbol, base_currency, quote_currency, description, digits, point, spread, 
+                   tick_size, tick_value, trade_contract_size, trade_mode, trade_execution_mode, 
+                   volume_min, volume_max, volume_step, margin_long, margin_short, margin_maintenance, 
+                   margin_hedged, margin_currency, start_date, expiration_date, 
+                   swap_long, swap_short, swap_type, swap_3days, trade_sessions, var_1_lot, bid_price, ask_price,
+                   sector_name, industry_name);
       }
    }
    // Close the CSV file
    FileClose(file_handle);
    Print("Export completed. File saved at: ", CSVFilePath);
-   // Remove the EA from the chart
-   Print("ExportSymbols EA removed from chart.");
-   ExpertRemove();
 }
+// Function to get the trade session information as a formatted string
 string GetTradeSessions(string symbol)
 {
    string result = "";
@@ -134,50 +135,4 @@ string GetTradeSessions(string symbol)
       }
    }
    return result;
-}
-string GetSector(string symbol)
-{
-   int sector = (int)SymbolInfoInteger(symbol, SYMBOL_SECTOR);
-   switch(sector)
-   {
-      case 1:  return "Basic Materials";
-      case 2:  return "Communications";
-      case 3:  return "Consumer Cyclical";
-      case 4:  return "Consumer Non-Cyclical";
-      case 5:  return "Energy";
-      case 6:  return "Financial";
-      case 7:  return "Healthcare";
-      case 8:  return "Industrial";
-      case 9:  return "Technology";
-      case 10: return "Utilities";
-      default: return "Unknown";
-   }
-}
-string GetIndustry(string symbol)
-{
-   int industry = (int)SymbolInfoInteger(symbol, SYMBOL_INDUSTRY);
-   switch(industry)
-   {
-      case 1:  return "Automobiles";
-      case 2:  return "Banks";
-      case 3:  return "Chemicals";
-      case 4:  return "Construction";
-      case 5:  return "Consumer Products";
-      case 6:  return "Electronics";
-      case 7:  return "Energy";
-      case 8:  return "Financial";
-      case 9:  return "Healthcare";
-      case 10: return "Industrial";
-      case 11: return "Insurance";
-      case 12: return "Media";
-      case 13: return "Pharmaceuticals";
-      case 14: return "Real Estate";
-      case 15: return "Retail";
-      case 16: return "Software";
-      case 17: return "Technology";
-      case 18: return "Telecommunications";
-      case 19: return "Transportation";
-      case 20: return "Utilities";
-      default: return "Unknown";
-   }
 }
