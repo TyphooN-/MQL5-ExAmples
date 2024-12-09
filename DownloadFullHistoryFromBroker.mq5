@@ -25,43 +25,37 @@
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.000"
-// Function to ensure full historical data is downloaded
 void EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    PrintFormat("Downloading full history for symbol: %s on timeframe: %d", symbol, timeframe);
-
    // Define an array to store historical data
    MqlRates rates[];
-
    // Set start and end times to cover the maximum range
    datetime start_time = D'1970.01.01 00:00'; // Earliest possible time
    datetime end_time   = TimeCurrent();      // Current server time
-
    // Request all available bars
    int bars = CopyRates(symbol, timeframe, start_time, end_time, rates);
-
    // Check if the data was successfully downloaded
    if (bars > 0)
+   {
       PrintFormat("Downloaded %d bars for symbol: %s on timeframe: %d", bars, symbol, timeframe);
+   }
    else
+   {
       PrintFormat("Failed to download data for symbol: %s on timeframe: %d", symbol, timeframe);
+   }
 }
-
-// Script entry point
 void OnStart()
 {
    // Get the total number of symbols in the Market Watch
    int total_symbols = SymbolsTotal(true);
-
    // Set the target timeframe
    ENUM_TIMEFRAMES timeframe = PERIOD_MN1;
-
    // Loop through all symbols
    for (int i = 0; i < total_symbols; i++) 
    {
       // Get the symbol name
       string symbol = SymbolName(i, true);
-
       if (symbol != "") 
       {
          // Ensure full historical data is downloaded
@@ -72,6 +66,5 @@ void OnStart()
          PrintFormat("Failed to retrieve symbol at index: %d", i);
       }
    }
-
    Print("Full historical data download completed for all symbols.");
 }
