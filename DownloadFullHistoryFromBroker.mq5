@@ -24,7 +24,7 @@
 #property strict
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.000"
+#property version   "1.001"
 void EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    PrintFormat("Downloading full history for symbol: %s on timeframe: %d", symbol, timeframe);
@@ -55,7 +55,7 @@ void OnStart()
    for (int i = 0; i < total_symbols; i++) 
    {
       // Get the symbol name
-      string symbol = SymbolName(i, true);
+      string symbol = SymbolName(i, false); // retrieve all broker symbols not just watchlist
       if (symbol != "") 
       {
          // Ensure full historical data is downloaded
