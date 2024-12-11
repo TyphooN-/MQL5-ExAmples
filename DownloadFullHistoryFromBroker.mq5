@@ -24,8 +24,8 @@
 #property strict
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.001"
-void EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
+#property version   "1.002"
+bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    PrintFormat("Downloading full history for symbol: %s on timeframe: %d", symbol, timeframe);
    // Define an array to store historical data
@@ -39,32 +39,42 @@ void EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
    if (bars > 0)
    {
       PrintFormat("Downloaded %d bars for symbol: %s on timeframe: %d", bars, symbol, timeframe);
+      return true; // Success
    }
    else
    {
       PrintFormat("Failed to download data for symbol: %s on timeframe: %d", symbol, timeframe);
+      return false; // Failure
    }
 }
 void OnStart()
 {
-   // Get the total number of symbols in the Market Watch
-   int total_symbols = SymbolsTotal(true);
-   // Set the target timeframe
+   int total_symbols = SymbolsTotal(false);
    ENUM_TIMEFRAMES timeframe = PERIOD_MN1;
-   // Loop through all symbols
-   for (int i = 0; i < total_symbols; i++) 
+   int success_count = 0;
+   int failure_count = 0;
+   string failed_symbols = "";
+   PrintFormat("Total symbols available from broker: %d", total_symbols);
+   for (int i = 0; i < total_symbols; i++)
    {
-      // Get the symbol name
-      string symbol = SymbolName(i, false); // retrieve all broker symbols not just watchlist
-      if (symbol != "") 
+      string symbol = SymbolName(i, false);
+      if (symbol != "")
       {
-         // Ensure full historical data is downloaded
-         EnsureFullHistory(symbol, timeframe);
-      } 
-      else 
-      {
-         PrintFormat("Failed to retrieve symbol at index: %d", i);
+         if (EnsureFullHistory(symbol, timeframe))
+         {
+            success_count++;
+         }
+         else
+         {
+            failure_count++;
+            failed_symbols += symbol + "\n";
+         }
       }
    }
-   Print("Full historical data download completed for all symbols.");
+   PrintFormat("Full historical data download completed.");
+   PrintFormat("Total symbols processed: %d", total_symbols);
+   PrintFormat("Successfully downloaded data for %d symbols.", success_count);
+   PrintFormat("Failed to download data for %d symbols.", failure_count);
+   if (failed_symbols != "")
+      PrintFormat("Failed symbols:\n%s", failed_symbols);
 }
