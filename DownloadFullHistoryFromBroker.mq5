@@ -24,7 +24,7 @@
 #property strict
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.002"
+#property version   "1.003"
 bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    PrintFormat("Downloading full history for symbol: %s on timeframe: %d", symbol, timeframe);
@@ -49,32 +49,40 @@ bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 }
 void OnStart()
 {
+   // List of timeframes to download
+   ENUM_TIMEFRAMES timeframes[] = {PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   // Total symbols available
    int total_symbols = SymbolsTotal(false);
-   ENUM_TIMEFRAMES timeframe = PERIOD_MN1;
    int success_count = 0;
    int failure_count = 0;
    string failed_symbols = "";
    PrintFormat("Total symbols available from broker: %d", total_symbols);
+   // Loop through all symbols
    for (int i = 0; i < total_symbols; i++)
    {
       string symbol = SymbolName(i, false);
       if (symbol != "")
       {
-         if (EnsureFullHistory(symbol, timeframe))
+         // Loop through each timeframe
+         for (int t = 0; t < ArraySize(timeframes); t++)
          {
-            success_count++;
-         }
-         else
-         {
-            failure_count++;
-            failed_symbols += symbol + "\n";
+            ENUM_TIMEFRAMES timeframe = timeframes[t];
+            PrintFormat("Downloading data for %s on timeframe: %d", symbol, timeframe);
+            if (EnsureFullHistory(symbol, timeframe))
+               success_count++;
+            else
+            {
+               failure_count++;
+               failed_symbols += StringFormat("%s (timeframe: %d)\n", symbol, timeframe);
+            }
          }
       }
    }
+   // Print summary
    PrintFormat("Full historical data download completed.");
    PrintFormat("Total symbols processed: %d", total_symbols);
-   PrintFormat("Successfully downloaded data for %d symbols.", success_count);
-   PrintFormat("Failed to download data for %d symbols.", failure_count);
+   PrintFormat("Successfully downloaded data for %d timeframes.", success_count);
+   PrintFormat("Failed to download data for %d timeframes.", failure_count);
    if (failed_symbols != "")
-      PrintFormat("Failed symbols:\n%s", failed_symbols);
+      PrintFormat("Failed symbols and timeframes:\n%s", failed_symbols);
 }
