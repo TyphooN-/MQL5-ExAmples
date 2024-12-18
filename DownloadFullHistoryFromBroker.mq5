@@ -24,10 +24,27 @@
 #property strict
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.003"
+#property version   "1.004"
+string TimeframeToString(ENUM_TIMEFRAMES timeframe)
+{
+   switch (timeframe)
+   {
+      case PERIOD_M1:   return "1 Minute";
+      case PERIOD_M5:   return "5 Minutes";
+      case PERIOD_M15:  return "15 Minute";
+      case PERIOD_M30:  return "30 Minute";
+      case PERIOD_H1:   return "1 Hour";
+      case PERIOD_H4:   return "4 Hour";
+      case PERIOD_D1:   return "1 Day";
+      case PERIOD_W1:   return "1 Week";
+      case PERIOD_MN1:  return "1 Month";
+      default:          return "Unknown";
+   }
+}
 bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
-   PrintFormat("Downloading full history for symbol: %s on timeframe: %d", symbol, timeframe);
+   string tf_str = TimeframeToString(timeframe);
+   PrintFormat("Downloading full history for symbol: %s on timeframe: %s", symbol, tf_str);
    // Define an array to store historical data
    MqlRates rates[];
    // Set start and end times to cover the maximum range
@@ -38,19 +55,19 @@ bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
    // Check if the data was successfully downloaded
    if (bars > 0)
    {
-      PrintFormat("Downloaded %d bars for symbol: %s on timeframe: %d", bars, symbol, timeframe);
+      PrintFormat("Downloaded %d bars for symbol: %s on timeframe: %s", bars, symbol, tf_str);
       return true; // Success
    }
    else
    {
-      PrintFormat("Failed to download data for symbol: %s on timeframe: %d", symbol, timeframe);
+      PrintFormat("Failed to download data for symbol: %s on timeframe: %s", symbol, tf_str);
       return false; // Failure
    }
 }
 void OnStart()
 {
    // List of timeframes to download
-   ENUM_TIMEFRAMES timeframes[] = {PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   ENUM_TIMEFRAMES timeframes[] = {PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1, PERIOD_MN1};
    // Total symbols available
    int total_symbols = SymbolsTotal(false);
    int success_count = 0;
@@ -67,13 +84,14 @@ void OnStart()
          for (int t = 0; t < ArraySize(timeframes); t++)
          {
             ENUM_TIMEFRAMES timeframe = timeframes[t];
-            PrintFormat("Downloading data for %s on timeframe: %d", symbol, timeframe);
+            string tf_str = TimeframeToString(timeframe);
+            PrintFormat("Downloading data for %s on timeframe: %s", symbol, tf_str);
             if (EnsureFullHistory(symbol, timeframe))
                success_count++;
             else
             {
                failure_count++;
-               failed_symbols += StringFormat("%s (timeframe: %d)\n", symbol, timeframe);
+               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, tf_str);
             }
          }
       }
