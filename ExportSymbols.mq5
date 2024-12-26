@@ -23,20 +23,25 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.006"
+#property version     "1.007"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
-// Input parameter for the output CSV file path
-input string CSVFilePath = "SymbolsList.csv";
 // Instantiate the portfolio risk manager
 CPortfolioRiskMan portfolioRiskMan(PERIOD_D1, 20);  // Example: Using daily timeframe and 20 periods for StdDev
 // Indicator initialization function
+// Input parameter for optional user-specified CSV file path
+input string UserCSVFilePath = "";
+// Variable to hold the actual file path used for export
+string CSVFilePath;
 int OnInit()
 {
+   string server_name = AccountInfoString(ACCOUNT_SERVER);
+   string server_date = TimeToString(TimeCurrent(), TIME_DATE); // Only the date
+   CSVFilePath = StringFormat("SymbolsExport-%s-%s.csv", server_name, server_date);
+   Print("Exporting symbols to file: ", CSVFilePath);
    // Call the function to export symbols to CSV
    ExportSymbolsToCSV();
-   
    // Terminate the indicator after initialization
    return(INIT_SUCCEEDED);
 }
