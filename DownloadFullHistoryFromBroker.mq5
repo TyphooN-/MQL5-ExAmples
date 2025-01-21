@@ -24,7 +24,7 @@
 #property strict
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.004"
+#property version   "1.005"
 string TimeframeToString(ENUM_TIMEFRAMES timeframe)
 {
    switch (timeframe)
@@ -44,7 +44,7 @@ string TimeframeToString(ENUM_TIMEFRAMES timeframe)
 bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    string tf_str = TimeframeToString(timeframe);
-   PrintFormat("Downloading full history for symbol: %s on timeframe: %s", symbol, tf_str);
+ //  PrintFormat("Downloading full history for symbol: %s on timeframe: %s", symbol, tf_str);
    // Define an array to store historical data
    MqlRates rates[];
    // Set start and end times to cover the maximum range
@@ -67,7 +67,7 @@ bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 void OnStart()
 {
    // List of timeframes to download
-   ENUM_TIMEFRAMES timeframes[] = {PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1, PERIOD_MN1};
+   ENUM_TIMEFRAMES timeframes[] = {PERIOD_D1, PERIOD_W1, PERIOD_MN1};
    // Total symbols available
    int total_symbols = SymbolsTotal(false);
    int success_count = 0;
@@ -85,7 +85,7 @@ void OnStart()
          {
             ENUM_TIMEFRAMES timeframe = timeframes[t];
             string tf_str = TimeframeToString(timeframe);
-            PrintFormat("Downloading data for %s on timeframe: %s", symbol, tf_str);
+   //         PrintFormat("Downloading data for %s on timeframe: %s", symbol, tf_str);
             if (EnsureFullHistory(symbol, timeframe))
                success_count++;
             else
