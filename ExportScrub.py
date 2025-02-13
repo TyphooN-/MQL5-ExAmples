@@ -1,19 +1,32 @@
 import pandas as pd
 import yfinance as yf
-def fetch_monthly_volume(symbol):
+def fetch_monthly_volumes(symbols):
     """
-    Fetch the latest monthly trading volume for a given symbol.
+    Fetch the latest monthly trading volume for multiple symbols.
+    Args:
+        symbols (list): List of ticker symbols.
     Returns:
-        float: The latest monthly volume or None if unavailable.
+        dict: Dictionary mapping symbol to its latest monthly volume, or None if unavailable.
     """
     try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period="1mo")  # Fetch 1 month of data
-        if not data.empty:
-            return data['Volume'].iloc[-1]  # Get the latest volume
+        # Fetch data for all symbols at once
+        data = yf.download(symbols, period="1mo")
+        # Initialize a dictionary to store results
+        volumes = {}
+        # Extract the latest volume for each symbol
+        for symbol in symbols:
+            if symbol in data['Volume']:
+                vol_df = data['Volume'][symbol]
+                if not vol_df.empty:
+                    volumes[symbol] = vol_df.iloc[-1]
+                else:
+                    volumes[symbol] = None
+            else:
+                volumes[symbol] = None
+        return volumes
     except Exception as e:
-        print(f"Error fetching data for {symbol}: {e}")
-    return None
+        print(f"Error fetching data for symbols: {e}")
+        return None
 def main(input_csv_path, output_csv_path):
     """
     Read the CSV file, fetch monthly volumes for all symbols, and save the updated CSV.
@@ -32,21 +45,23 @@ def main(input_csv_path, output_csv_path):
     if 'Symbol' not in df.columns:
         print("Error: 'Symbol' column not found in the CSV.")
         return
+    # Extract all symbols from the dataframe
+    symbols = df['Symbol'].unique().tolist()
     # Initialize a new column for Volume if it doesn't exist
     if 'Volume' not in df.columns:
         df['Volume'] = None
-    # Fetch volume for each symbol
-    for index, row in df.iterrows():
-        symbol = row['Symbol']
-        print(f"Fetching volume for {symbol}...")
-        try:
-            volume = fetch_monthly_volume(symbol)
-            if volume is not None:
-                df.loc[index, 'Volume'] = volume
-            else:
-                print(f"No volume data available for {symbol}.")
-        except Exception as e:
-            print(f"Error processing symbol {symbol}: {str(e)}")
+    print(f"Fetching volumes for {len(symbols)} symbols...")
+    # Fetch volumes for all symbols at once
+    try:
+        volumes = fetch_monthly_volumes(symbols)
+        if volumes is not None:
+            # Update the dataframe with fetched volumes
+            for index, row in df.iterrows():
+                symbol = row['Symbol']
+                if symbol in volumes:
+                    df.loc[index, 'Volume'] = volumes[symbol]
+    except Exception as e:
+        print(f"Error processing symbols: {str(e)}")
     # Save the updated dataframe to a new CSV file
     try:
         df.to_csv(output_csv_path, index=False)
