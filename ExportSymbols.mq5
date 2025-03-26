@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.007"
+#property version     "1.008"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex\DWEX Portfolio Risk Man.mqh>
@@ -38,7 +38,14 @@ int OnInit()
 {
    string server_name = AccountInfoString(ACCOUNT_SERVER);
    string server_date = TimeToString(TimeCurrent(), TIME_DATE); // Only the date
-   CSVFilePath = StringFormat("SymbolsExport-%s-%s.csv", server_name, server_date);
+   string server_type = "";
+   // Check for USDMXN to determine server type
+   if (SymbolInfoDouble("USDMXN", SYMBOL_BID) > 0) {
+     server_type = "CFD";
+   } else {
+     server_type = "Stocks";
+   }
+   CSVFilePath = StringFormat("SymbolsExport-%s-%s-%s.csv", server_name, server_type, server_date);
    Print("Exporting symbols to file: ", CSVFilePath);
    // Call the function to export symbols to CSV
    ExportSymbolsToCSV();
