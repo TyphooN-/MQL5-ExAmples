@@ -3,7 +3,7 @@ Example EAs/functions that do not make sense to exist in other repos.
 
 # Discord Market Wizardry Community / Darwinex Zero Coupon Code
 - Join my Discord community for support with my EA and indicators, and also share trading ideas at http://marketwizardry.info/
-- Use the coupon code DWZ2314896MGM at checkout for Darwinex Zero for a €10 discount!
+- [Darwinex (Discount CODE: TYPHOON)](https://www.darwinexzero.com?fpr=qsgtk&COUPON=TYPHOON) Certify your track record without putting your capital at risk.  Demonstrate your ability to achieve long-term returns and attract investment through Darwinex from $43/month.
 
 # Usage
 This project is intended and may be freely used for education and entertainment purposes.
