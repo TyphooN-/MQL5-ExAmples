@@ -92,6 +92,9 @@ public:
     double ask_price;
     string sector_name;
     string industry_name;
+    double atr_daily;
+    double atr_weekly;
+    double atr_monthly;
 
     void CSymbolInfo(string sym)
     {
@@ -130,6 +133,11 @@ public:
         ask_price = SymbolInfoDouble(symbol, SYMBOL_ASK);
         sector_name = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
         industry_name = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
+        
+        double atr_values_d[], atr_values_w[], atr_values_m[];
+        if(CopyBuffer(iATR(symbol, PERIOD_D1, 14), 0, 1, 1, atr_values_d) > 0) atr_daily = atr_values_d[0]; else atr_daily = 0;
+        if(CopyBuffer(iATR(symbol, PERIOD_W1, 14), 0, 1, 1, atr_values_w) > 0) atr_weekly = atr_values_w[0]; else atr_weekly = 0;
+        if(CopyBuffer(iATR(symbol, PERIOD_MN1, 14), 0, 1, 1, atr_values_m) > 0) atr_monthly = atr_values_m[0]; else atr_monthly = 0;
     }
 };
 
@@ -143,7 +151,7 @@ void ExportSymbolsToCSV()
         return;
     }
 
-    FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName;IndustryName\n");
+    FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName;IndustryName;ATR_D1;ATR_W1;ATR_MN1\n");
 
     int total_symbols = SymbolsTotal(false);
     int batch_size = 100; // Process 100 symbols at a time
@@ -166,7 +174,7 @@ void ExportSymbolsToCSV()
         for (int j = 0; j < current_batch_size; j++)
         {
             if (CheckPointer(symbols_data[j]) == POINTER_INVALID) continue;
-            string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%s;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s\n",
+            string line = StringFormat("%s;%s;%s;%s;%d;%f;%d;%f;%f;%f;%d;%d;%f;%f;%f;%f;%f;%f;%s;%s;%s;%f;%f;%d;%d;%s;%f;%f;%f;%s;%s;%f;%f;%f\n",
                 symbols_data[j].symbol, symbols_data[j].base_currency, symbols_data[j].quote_currency, symbols_data[j].description,
                 symbols_data[j].digits, symbols_data[j].point, symbols_data[j].spread, symbols_data[j].tick_size,
                 symbols_data[j].tick_value, symbols_data[j].trade_contract_size, symbols_data[j].trade_mode,
@@ -178,7 +186,7 @@ void ExportSymbolsToCSV()
                 symbols_data[j].swap_long, symbols_data[j].swap_short, symbols_data[j].swap_type,
                 symbols_data[j].swap_3days, symbols_data[j].trade_sessions, symbols_data[j].var_1_lot,
                 symbols_data[j].bid_price, symbols_data[j].ask_price, symbols_data[j].sector_name,
-                symbols_data[j].industry_name);
+                symbols_data[j].industry_name, symbols_data[j].atr_daily, symbols_data[j].atr_weekly, symbols_data[j].atr_monthly);
             FileWriteString(file_handle, line);
         }
 
