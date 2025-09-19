@@ -23,7 +23,7 @@
  **/
 #property copyright   "Copyright 2024 TyphooN (MarketWizardry.org)"
 #property link        "https://www.marketwizardry.info"
-#property version     "1.009"
+#property version     "1.011"
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex/DWEX Portfolio Risk Man.mqh>
@@ -41,7 +41,7 @@ int OnInit()
    if (SymbolInfoDouble("USDMXN", SYMBOL_BID) > 0) {
      server_type = "CFD";
    }
-   else if (SymbolInfoDouble("ES_U", SYMBOL_BID) > 0) {
+   else if (SymbolInfoDouble("ES_U", SYMBOL_BID) > 0 || SymbolInfoDouble("ES_Z", SYMBOL_BID) > 0) {
      server_type = "Futures";
    }
    else
