@@ -1,6 +1,15 @@
+/**=             OrderLoop.mq5  (TyphooN's Batch Order Placer)
+ *               Copyright 2023, TyphooN (https://www.marketwizardry.org/)
+ *
+ * This file is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ **/
 #include <Trade\Trade.mqh>
-input double Lots = 1000; // Input for the number of lots to sell per order
-double TotalLotsToSell = 21000000; // Total lots to sell (1000 units)
+input double Lots = 1000;              // Lots per order
+input double TotalLotsToSell = 21000;  // Total lots to sell
 double LotsSold = 0.0; // Variable to keep track of the total lots sold
 CTrade trade; // Create an instance of the trade class
 //+------------------------------------------------------------------+

@@ -36,7 +36,7 @@ def main(input_csv_path, output_csv_path):
     """
     try:
         # Specify the correct delimiter handling
-        df = pd.read_csv(input_csv_path, engine='python', sep='[;]', on_bad_lines='skip')
+        df = pd.read_csv(input_csv_path, sep=';', on_bad_lines='skip')
         print("Successfully read the input CSV file.")
     except Exception as e:
         print(f"Error reading the CSV file: {e}")

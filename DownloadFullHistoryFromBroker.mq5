@@ -1,4 +1,4 @@
-/**=             Discord.mq5  (TyphooN's DownloadFullHistoryFromBroker)
+/**=             DownloadFullHistoryFromBroker.mq5  (TyphooN's Full History Downloader)
  *               Copyright 2023, TyphooN (https://www.marketwizardry.org/)
  *
  * Disclaimer and Licence

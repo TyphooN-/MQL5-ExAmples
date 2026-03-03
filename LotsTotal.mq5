@@ -1,4 +1,4 @@
-/**=             MTF_MA.mq5  (TyphooN's LotsTotal Indicator)
+/**=             LotsTotal.mq5  (TyphooN's LotsTotal Indicator)
  *               Copyright 2023, TyphooN (https://www.marketwizardry.info)
  *
  * Disclaimer and Licence
@@ -53,9 +53,9 @@ double GetTotalShortVolumeForSymbol(string symbol)
    }
    return totalVolume;
 }
-void CalculatePriceChangePerTick(string symbol)
+double GetTotalVolumeForSymbol(string symbol)
 {
-
+   return GetTotalLongVolumeForSymbol(symbol) + GetTotalShortVolumeForSymbol(symbol);
 }
 int OnInit()
 {

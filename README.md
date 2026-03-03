@@ -1,9 +1,33 @@
 # MQL5-ExAmples
-Example EAs/functions that do not make sense to exist in other repos.
+Standalone MQL5 scripts, EAs, and Python utilities for market data management and trading automation.
 
 # Discord Market Wizardry Community / Darwinex Zero Coupon Code
 - Join my Discord community for support with my EA and indicators, and also share trading ideas at http://marketwizardry.info/
 - [Darwinex Zero (Discount CODE: TYPHOON)](https://www.darwinexzero.com?fpr=qsgtk&COUPON=TYPHOON) Certify your track record without putting your capital at risk.  Demonstrate your ability to achieve long-term returns and attract investment through Darwinex from $43/month.
+
+# Scripts
+
+| File | Type | Description |
+|------|------|-------------|
+| `DownloadFullHistoryFromBroker.mq5` | Script | Downloads complete OHLC history for all broker symbols across D1/W1/MN1 timeframes |
+| `ExportSymbols.mq5` | Script | Exports comprehensive symbol metadata (30+ properties, ATR, VaR) to semicolon-delimited CSV |
+| `ExportMonthlyOHLC.mq5` | Script | Exports monthly OHLC bars for all stock symbols to CSV (for data integrity auditing) |
+| `ExportScrub.py` | Python | Enriches ExportSymbols CSV with Yahoo Finance monthly volume data |
+| `CompareChartData.py` | Python | Compares Darwinex monthly OHLC against Yahoo Finance adjusted data to detect unadjusted corporate actions |
+| `Discord.mq5` | EA | Multi-sector market notification system via Discord webhooks |
+| `Market At Open.mq5` | EA | Queues a market order for execution when trading opens, with ATR-based SL/TP fallback |
+| `OrderLoop.mq5` | EA | Batch order placer — opens orders in a loop until a target total lot size is reached |
+| `LotsTotal.mq5` | Indicator | Displays total long/short volume and per-tick P/L impact for the current symbol |
+
+# Data Audit Workflow
+
+To detect symbols with unadjusted corporate actions (splits, mergers, restructurings) in broker data:
+
+1. Run `DownloadFullHistoryFromBroker.mq5` to ensure full history is cached
+2. Run `ExportMonthlyOHLC.mq5` to export monthly bars to CSV
+3. Copy the CSV from MT5's `MQL5/Files/` directory
+4. Run `python3 CompareChartData.py MonthlyOHLC-ServerName-Date.csv`
+5. Review the generated anomaly report
 
 # Usage
 This project is intended and may be freely used for education and entertainment purposes.
