@@ -34,19 +34,14 @@ int OnInit()
    string server_name = AccountInfoString(ACCOUNT_SERVER);
    string server_date = TimeToString(TimeCurrent(), TIME_DATE);
    string server_type = "";
-   if (SymbolInfoDouble("USDMXN", SYMBOL_BID) > 0) {
-     server_type = "CFD";
-   }
-   else if (SymbolInfoDouble("ES_U", SYMBOL_BID) > 0 || SymbolInfoDouble("ES_Z", SYMBOL_BID) > 0) {
-     server_type = "Futures";
-   }
-   else if (SymbolInfoDouble("BTCUSD", SYMBOL_BID) > 0 || SymbolInfoDouble("ETHUSD", SYMBOL_BID) > 0) {
-     server_type = "Crypto";
-   }
+   if (SymbolInfoDouble("USDMXN", SYMBOL_BID) > 0)
+      server_type = "CFD";
+   else if (SymbolInfoDouble("ES_U", SYMBOL_BID) > 0 || SymbolInfoDouble("ES_Z", SYMBOL_BID) > 0)
+      server_type = "Futures";
+   else if (SymbolInfoDouble("BTCUSD", SYMBOL_BID) > 0 || SymbolInfoDouble("ETHUSD", SYMBOL_BID) > 0)
+      server_type = "Crypto";
    else
-   {
-     server_type = "Stocks";
-   }
+      server_type = "Stocks";
    CSVFilePath = StringFormat("SymbolsExport-%s-%s-%s.csv", server_name, server_type, server_date);
    Print("Exporting symbols to file: ", CSVFilePath);
    ExportSymbolsToCSV();

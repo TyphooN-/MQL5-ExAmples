@@ -11,10 +11,11 @@ Usage:
 Output: CSV report of symbols with data anomalies, sorted by severity.
 """
 
-import pandas as pd
-import yfinance as yf
 import sys
 import os
+
+import pandas as pd
+import yfinance as yf
 
 # Threshold for flagging a month as anomalous (ratio divergence from recent baseline)
 RATIO_THRESHOLD = 0.20  # 20% deviation flags an anomaly

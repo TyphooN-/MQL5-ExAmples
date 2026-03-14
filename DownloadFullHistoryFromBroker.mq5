@@ -25,25 +25,9 @@
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.005"
-string TimeframeToString(ENUM_TIMEFRAMES timeframe)
-{
-   switch (timeframe)
-   {
-      case PERIOD_M1:   return "1 Minute";
-      case PERIOD_M5:   return "5 Minutes";
-      case PERIOD_M15:  return "15 Minute";
-      case PERIOD_M30:  return "30 Minute";
-      case PERIOD_H1:   return "1 Hour";
-      case PERIOD_H4:   return "4 Hour";
-      case PERIOD_D1:   return "1 Day";
-      case PERIOD_W1:   return "1 Week";
-      case PERIOD_MN1:  return "1 Month";
-      default:          return "Unknown";
-   }
-}
 bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
-   string tf_str = TimeframeToString(timeframe);
+   string tf_str = EnumToString(timeframe);
    MqlRates rates[];
    datetime start_time = D'1970.01.01 00:00';
    datetime end_time   = TimeCurrent();
@@ -79,7 +63,7 @@ void OnStart()
             else
             {
                failure_count++;
-               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, TimeframeToString(timeframes[t]));
+               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, EnumToString(timeframes[t]));
             }
          }
       }

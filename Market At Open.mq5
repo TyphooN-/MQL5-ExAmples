@@ -80,7 +80,7 @@ double CalculateATR(int period)
    int copied = CopyBuffer(atrHandle, 0, 0, 1, atrValue);
    IndicatorRelease(atrHandle);
 
-   if (copied < 0)
+   if (copied <= 0)
    {
       Print("Failed to copy ATR data.");
       return 0;
@@ -123,18 +123,19 @@ void PlaceMarketOrder()
    bool isBuy = (OrderType == ORDER_TYPE_BUY);
    double price = isBuy ? ask : bid;
 
-   double sl = StopLossPrice;
-   double tp = TakeProfitPrice;
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double sl = NormalizeDouble(StopLossPrice, digits);
+   double tp = NormalizeDouble(TakeProfitPrice, digits);
 
    if (!IsStopLossValid(price, sl, isBuy) && StopLossATR > 0)
    {
-      sl = isBuy ? price - (atr * StopLossATR) : price + (atr * StopLossATR);
+      sl = NormalizeDouble(isBuy ? price - (atr * StopLossATR) : price + (atr * StopLossATR), digits);
       if (!IsStopLossValid(price, sl, isBuy)) sl = 0;
    }
 
    if (!IsTakeProfitValid(price, tp, isBuy) && TakeProfitATR > 0)
    {
-      tp = isBuy ? price + (atr * TakeProfitATR) : price - (atr * TakeProfitATR);
+      tp = NormalizeDouble(isBuy ? price + (atr * TakeProfitATR) : price - (atr * TakeProfitATR), digits);
       if (!IsTakeProfitValid(price, tp, isBuy)) tp = 0;
    }
 

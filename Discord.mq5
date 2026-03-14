@@ -144,7 +144,7 @@ void SendPowerNotification()
    string headers = "Content-Type: application/json";
    uchar result[];
    string result_headers;
-   WebRequest("POST", url, headers, 10, jsonArray, result, result_headers);
+   WebRequest("POST", url, headers, 5000, jsonArray, result, result_headers);
    LastPowerNotification = TimeCurrent();
 }
 void OnTick()
