@@ -29,34 +29,76 @@
 #property copyright     "Copyright 2022, Darwinex / TyphooN (v1.01+)"
 #property link          "https://www.darwinex.com"
 #property description   "Portfolio Risk Management Module"
-#property version       "1.04"
+#property version       "1.06"
 #property strict
-#include <Math\Stat\Math.mqh>
 
 class CPortfolioRiskMan
 {
 public:
     double SinglePositionVaR;
-    void CPortfolioRiskMan(ENUM_TIMEFRAMES VaRTimeframe, int StdDevPeriods); //CONSTRUCTOR
+    void CPortfolioRiskMan(ENUM_TIMEFRAMES VaRTimeframe, int StdDevPeriods, double ConfidenceLevel = 0.95); //CONSTRUCTOR
+   ~CPortfolioRiskMan() { ClearCache(); }
     bool CalculateVaR(string Asset, double AssetPosSize);
     bool CalculateLotSizeBasedOnVaR(string Asset, double confidenceLevel, double accountEquity, double VaRPercent, double &lotSize);
+    void ReserveCache(int size);
+    void ClearCache();
 
 private:
     ENUM_TIMEFRAMES ValueAtRiskTimeframe;
     int StandardDeviationPeriods;
+    double VaRConfidenceLevel;
     double m_stdDevReturnsCache[];
     string m_symbolCache[];
     datetime m_cacheTimestamp[];
+    int    m_cacheCount;
+    // Reusable work arrays — avoid heap alloc/free per symbol
+    double m_returns[];
+    double m_dailyReturns[];
 
     bool GetAssetStdDevReturns(string VolSymbolName, double &StandardDevOfReturns);
     double InverseCumulativeNormal(double p);
-    void ClearCache() { ArrayFree(m_stdDevReturnsCache); ArrayFree(m_symbolCache); ArrayFree(m_cacheTimestamp); }
+    double StdDev(const double &arr[], int count);
 };
 //CONSTRUCTOR
-void CPortfolioRiskMan::CPortfolioRiskMan(ENUM_TIMEFRAMES VaRTF, int SDPeriods)  
+void CPortfolioRiskMan::CPortfolioRiskMan(ENUM_TIMEFRAMES VaRTF, int SDPeriods, double ConfidenceLevel)
 {
    ValueAtRiskTimeframe     = VaRTF;
    StandardDeviationPeriods = SDPeriods;
+   VaRConfidenceLevel       = ConfidenceLevel;
+   m_cacheCount             = 0;
+   // Pre-allocate work arrays to avoid per-call heap churn
+   ArrayResize(m_returns, SDPeriods + 1);
+   ArrayResize(m_dailyReturns, SDPeriods);
+}
+void CPortfolioRiskMan::ClearCache()
+{
+   ArrayFree(m_stdDevReturnsCache);
+   ArrayFree(m_symbolCache);
+   ArrayFree(m_cacheTimestamp);
+   ArrayFree(m_returns);
+   ArrayFree(m_dailyReturns);
+   m_cacheCount = 0;
+}
+void CPortfolioRiskMan::ReserveCache(int size)
+{
+   ArrayResize(m_symbolCache, size);
+   ArrayResize(m_stdDevReturnsCache, size);
+   ArrayResize(m_cacheTimestamp, size);
+   m_cacheCount = 0;
+}
+// Inline StdDev — avoids #include <Math\Stat\Math.mqh> (heavy)
+double CPortfolioRiskMan::StdDev(const double &arr[], int count)
+{
+   if (count < 2) return 0;
+   double sum = 0, sumSq = 0;
+   for (int i = 0; i < count; i++)
+   {
+      sum   += arr[i];
+      sumSq += arr[i] * arr[i];
+   }
+   double mean = sum / count;
+   double variance = (sumSq / count) - (mean * mean);
+   return (variance > 0) ? MathSqrt(variance) : 0;
 }
 bool CPortfolioRiskMan::CalculateVaR(string Asset, double AssetPosSize) //N.B. ProposedPosSize should be +ve for a LONG pos and -ve for a SHORT pos                 
 {  
@@ -64,16 +106,22 @@ bool CPortfolioRiskMan::CalculateVaR(string Asset, double AssetPosSize) //N.B. P
    double stdDevReturns;
    if(!GetAssetStdDevReturns(Asset, stdDevReturns)) //2nd param passed by ref
    {
-      Alert("Error calculating Std Dev of Returns for " + Asset + " in: " + __FUNCTION__ + "()");
+      Print("Error calculating Std Dev of Returns for " + Asset + " in: " + __FUNCTION__ + "()");
       return false;
    }
    //GET NOMINAL VALUE FOR PROPOSED POSITION
    //TODO: THIS ASSUMES ALL ASSETS CALCULATED USING ACCOUNT CURRENCY. FOR OTHERS E.G. SPX500 NEED TO DO CURRENCY CONVERSION
-   double nominalValuePerUnitPerLot = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_VALUE) / SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_SIZE);
-   double nominalValue              = MathAbs(AssetPosSize) * nominalValuePerUnitPerLot * iClose(Asset, PERIOD_M1, 0);  //RATIONALE: This calculates how much would be lost on a position that moved from its current price to a 0 price. This is equivalent to the nominal amount invested if we were trading with 1:1 leverage, i.e. the total amount you would lose if the asset's price went to 0
+   double tickSize = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_SIZE);
+   if (tickSize <= 0) { return false; }
+   double nominalValuePerUnitPerLot = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_VALUE) / tickSize;
+   if (nominalValuePerUnitPerLot <= 0) return false;
+   double closePrice = SymbolInfoDouble(Asset, SYMBOL_BID);
+   if (closePrice <= 0) return false;
+   double nominalValue              = MathAbs(AssetPosSize) * nominalValuePerUnitPerLot * closePrice;
    //CALCULATE THE VaR VALUES FOR THIS IND PROPOSED POSITION
-   //VaR Calculated on basis of "max expected loss in 1-day" at a "95% confidence level" (This value will be exceeded 1 day out of 20). The value of 1.65 is the 95% Z-Score for a one-tailed test
-   SinglePositionVaR = 1.65 * stdDevReturns * nominalValue; //nominalValue is always +ve because of MathAbs(AssetPosSize) above
+   double zScore = InverseCumulativeNormal(VaRConfidenceLevel);
+   if(zScore == 0) return false;
+   SinglePositionVaR = zScore * stdDevReturns * nominalValue; //nominalValue is always +ve because of MathAbs(AssetPosSize) above
    return true;
 }
 bool CPortfolioRiskMan::CalculateLotSizeBasedOnVaR(string Asset, double confidenceLevel, double accountEquity, double VaRPercent, double &lotSize)
@@ -82,19 +130,26 @@ bool CPortfolioRiskMan::CalculateLotSizeBasedOnVaR(string Asset, double confiden
    double stdDevReturns;
    if(!GetAssetStdDevReturns(Asset, stdDevReturns)) //2nd param passed by ref
    {
-      Alert("Error calculating Std Dev of Returns for " + Asset + " in: " + __FUNCTION__ + "()");
+      Print("Error calculating Std Dev of Returns for " + Asset + " in: " + __FUNCTION__ + "()");
       return false;
    }
    //GET NOMINAL VALUE PER UNIT PER LOT
-   double nominalValuePerUnitPerLot = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_VALUE) / SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_SIZE);
-   double currentPrice = iClose(Asset, PERIOD_M1, 0);
+   double tickSize = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_SIZE);
+   if (tickSize <= 0) { return false; }
+   double nominalValuePerUnitPerLot = SymbolInfoDouble(Asset, SYMBOL_TRADE_TICK_VALUE) / tickSize;
+   if (nominalValuePerUnitPerLot <= 0) { lotSize = 0; return false; }
+   double currentPrice = SymbolInfoDouble(Asset, SYMBOL_BID);
+   if (currentPrice <= 0) { lotSize = 0; return false; }
    //CALCULATE THE Z-SCORE FOR THE GIVEN CONFIDENCE LEVEL
    double zScore = InverseCumulativeNormal(confidenceLevel);
+   if(zScore == 0) { lotSize = 0; return false; }
    //CALCULATE THE VaR FOR A SINGLE UNIT OF THE ASSET
    double unitVaR = zScore * stdDevReturns * nominalValuePerUnitPerLot * currentPrice;
    //CALCULATE THE MAXIMUM VaR BASED ON THE ACCOUNT EQUITY AND VaR PERCENTAGE
+   if (accountEquity <= 0) { lotSize = 0; return false; }
    double maxVaR = (VaRPercent / 100.0) * accountEquity;
    //CALCULATE THE LOT SIZE BASED ON THE MAXIMUM VaR
+   if (unitVaR < 1e-10) { lotSize = 0; return false; }
    lotSize = maxVaR / unitVaR;
    return true;
 }
@@ -145,13 +200,13 @@ double CPortfolioRiskMan::InverseCumulativeNormal(double p)
              ((((d1 * q + d2) * q + d3) * q + d4) * q + 1);
    }
    // If p is outside the valid range
-   Alert("Error: p is out of range in InverseCumulativeNormal");
+   Print("Error: p is out of range in InverseCumulativeNormal");
    return 0;
 }
 bool CPortfolioRiskMan::GetAssetStdDevReturns(string VolSymbolName, double &StandardDevOfReturns)
 {
-    int existing_index = -1;
-    for (int i = 0; i < ArraySize(m_symbolCache); i++)
+    // Cache lookup — linear scan (sufficient for typical use; batch callers should ClearCache between batches)
+    for (int i = 0; i < m_cacheCount; i++)
     {
         if (m_symbolCache[i] == VolSymbolName)
         {
@@ -160,44 +215,59 @@ bool CPortfolioRiskMan::GetAssetStdDevReturns(string VolSymbolName, double &Stan
                 StandardDevOfReturns = m_stdDevReturnsCache[i];
                 return true;
             }
-            existing_index = i;
+            // Stale — recompute and update in place
             break;
         }
     }
 
-    double returns[];
-    if (CopyClose(VolSymbolName, ValueAtRiskTimeframe, 1, StandardDeviationPeriods + 1, returns) <= 0)
+    // CopyClose into pre-allocated work array (avoids heap alloc per call)
+    int needed = StandardDeviationPeriods + 1;
+    int copied = CopyClose(VolSymbolName, ValueAtRiskTimeframe, 1, needed, m_returns);
+    if (copied < needed)
     {
-        Print("Failed to copy close prices for ", VolSymbolName);
+        Print("Failed to copy enough close prices for ", VolSymbolName, " (got ", copied, ", need ", needed, ")");
         return false;
     }
 
-    double daily_returns[];
-    int returns_size = ArraySize(returns);
-    ArrayResize(daily_returns, returns_size - 1);
+    // Compute daily returns into pre-allocated work array
+    int numReturns = copied - 1;
+    if (ArraySize(m_dailyReturns) < numReturns)
+        ArrayResize(m_dailyReturns, numReturns);
 
-    for (int i = 0; i < returns_size - 1; i++)
+    for (int i = 0; i < numReturns; i++)
     {
-        daily_returns[i] = (returns[i+1] / returns[i]) - 1.0;
+        if (m_returns[i] == 0.0 || m_returns[i+1] == 0.0) { m_dailyReturns[i] = 0.0; continue; }
+        m_dailyReturns[i] = (m_returns[i+1] / m_returns[i]) - 1.0;
     }
 
-    StandardDevOfReturns = MathStandardDeviation(daily_returns);
+    StandardDevOfReturns = StdDev(m_dailyReturns, numReturns);
+    if (StandardDevOfReturns == 0 || !MathIsValidNumber(StandardDevOfReturns))
+    {
+        Print("StdDev of returns is zero or invalid for ", VolSymbolName);
+        return false;
+    }
 
-    if(existing_index != -1)
+    // Update or append cache entry
+    int slot = -1;
+    for (int i = 0; i < m_cacheCount; i++)
     {
-        m_stdDevReturnsCache[existing_index] = StandardDevOfReturns;
-        m_cacheTimestamp[existing_index] = TimeCurrent();
+        if (m_symbolCache[i] == VolSymbolName) { slot = i; break; }
     }
-    else
+    if (slot == -1)
     {
-        int cache_size = ArraySize(m_symbolCache);
-        ArrayResize(m_symbolCache, cache_size + 1);
-        ArrayResize(m_stdDevReturnsCache, cache_size + 1);
-        ArrayResize(m_cacheTimestamp, cache_size + 1);
-        m_symbolCache[cache_size] = VolSymbolName;
-        m_stdDevReturnsCache[cache_size] = StandardDevOfReturns;
-        m_cacheTimestamp[cache_size] = TimeCurrent();
+        int capacity = ArraySize(m_symbolCache);
+        if (m_cacheCount >= capacity)
+        {
+            int newCap = (capacity == 0) ? 256 : capacity * 2;
+            ArrayResize(m_symbolCache, newCap);
+            ArrayResize(m_stdDevReturnsCache, newCap);
+            ArrayResize(m_cacheTimestamp, newCap);
+        }
+        slot = m_cacheCount++;
     }
+    m_symbolCache[slot] = VolSymbolName;
+    m_stdDevReturnsCache[slot] = StandardDevOfReturns;
+    m_cacheTimestamp[slot] = TimeCurrent();
 
     return true;
 }
