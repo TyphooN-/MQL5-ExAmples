@@ -154,5 +154,3 @@ void PlaceMarketOrder()
       Print("Failed to place order. Error: ", trade.ResultRetcode());
    }
 }
-
-//+------------------------------------------------------------------+

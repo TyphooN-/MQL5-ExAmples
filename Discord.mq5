@@ -77,8 +77,8 @@ string GetWebhookURL()
 }
 bool ReadAndVerifyPower(double &bullHTF, double &bearHTF, double &bullLTF, double &bearLTF)
 {
-   if(!GlobalVariableCheck("GlobalBullPowerLTF") && !GlobalVariableCheck("GlobalBearPowerLTF") &&
-      !GlobalVariableCheck("GlobalBullPowerHTF") && !GlobalVariableCheck("GlobalBearPowerHTF"))
+   if(!GlobalVariableCheck("GlobalBullPowerLTF") || !GlobalVariableCheck("GlobalBearPowerLTF") ||
+      !GlobalVariableCheck("GlobalBullPowerHTF") || !GlobalVariableCheck("GlobalBearPowerHTF"))
       return false;
    int sleepDuration = 31337 + MathRand() % 7777;
    // Read initial values
@@ -115,6 +115,8 @@ bool ReadAndVerifyPower(double &bullHTF, double &bearHTF, double &bullLTF, doubl
 }
 void SendPowerNotification()
 {
+   string url = GetWebhookURL();
+   if(url == "") return;
    double bullHTF, bearHTF, bullLTF, bearLTF;
    if(!ReadAndVerifyPower(bullHTF, bearHTF, bullLTF, bearLTF))
       return;
@@ -125,8 +127,6 @@ void SendPowerNotification()
    if(bullHTF == LastBullPowerHTF && bearHTF == LastBearPowerHTF &&
       bullLTF == LastBullPowerLTF && bearLTF == LastBearPowerLTF)
       return;
-   string url = GetWebhookURL();
-   if(url == "") return;
    // Update stored values
    LastBullPowerHTF = bullHTF;
    LastBearPowerHTF = bearHTF;
