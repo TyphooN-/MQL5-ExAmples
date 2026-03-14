@@ -1,8 +1,30 @@
+/**=             Market At Open.mq5  (TyphooN's Market Reopen Order Queue EA)
+ *               Copyright 2023, TyphooN (https://www.marketwizardry.org/)
+ *
+ * Disclaimer and Licence
+ *
+ * This file is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * All trading involves risk. You should have received the risk warnings
+ * and terms of use in the README.MD file distributed with this software.
+ * See the README.MD file for more information and before using this software.
+ *
+ **/
+#property copyright "TyphooN"
+#property link      "https://www.marketwizardry.org/"
+#property version   "1.00"
 #include <Trade\Trade.mqh>
-
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
 
 input ENUM_ORDER_TYPE OrderType = ORDER_TYPE_BUY; // Order type (Buy/Sell)
 input double OrderLots = 1;                      // Order lot size
@@ -16,23 +38,11 @@ CTrade trade;  // Instance of CTrade class
 
 bool orderPlaced = false;
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
 int OnInit()
 {
-   // Set the expert's magic number
    trade.SetExpertMagicNumber(MagicNumber);
-
    Print("Market Reopen Order Queue EA initialized. Waiting for trading availability...");
    return INIT_SUCCEEDED;
-}
-
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
 }
 
 //+------------------------------------------------------------------+
@@ -40,19 +50,10 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Check if trading is available
+   if (orderPlaced) return;
+
    if (IsTradingAvailable())
-   {
-      if (!orderPlaced)
-      {
-         // If trading is available and the order is not placed yet, place the order
-         PlaceMarketOrder();
-      }
-   }
-   else
-   {
-      Print("Trading is not available for this symbol, waiting...");
-   }
+      PlaceMarketOrder();
 }
 
 //+------------------------------------------------------------------+
@@ -60,8 +61,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool IsTradingAvailable()
 {
-   long tradeMode = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_MODE); // Corrected variable type to long
-   return (tradeMode == SYMBOL_TRADE_MODE_FULL);
+   return (SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_FULL);
 }
 
 //+------------------------------------------------------------------+
@@ -77,7 +77,10 @@ double CalculateATR(int period)
    }
 
    double atrValue[];
-   if (CopyBuffer(atrHandle, 0, 0, 1, atrValue) < 0)
+   int copied = CopyBuffer(atrHandle, 0, 0, 1, atrValue);
+   IndicatorRelease(atrHandle);
+
+   if (copied < 0)
    {
       Print("Failed to copy ATR data.");
       return 0;
@@ -91,9 +94,7 @@ double CalculateATR(int period)
 //+------------------------------------------------------------------+
 bool IsStopLossValid(double price, double stopLoss, bool isBuy)
 {
-   // Retrieve the minimum stop level from the broker in points
-   long stopLevelPoints = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double stopLevel = stopLevelPoints * _Point;
+   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 
    if (isBuy)
       return (stopLoss < price && (price - stopLoss) >= stopLevel);
@@ -103,9 +104,7 @@ bool IsStopLossValid(double price, double stopLoss, bool isBuy)
 
 bool IsTakeProfitValid(double price, double takeProfit, bool isBuy)
 {
-   // Retrieve the minimum stop level from the broker in points
-   long stopLevelPoints = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double stopLevel = stopLevelPoints * _Point;
+   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 
    if (isBuy)
       return (takeProfit > price && (takeProfit - price) >= stopLevel);
@@ -118,43 +117,31 @@ bool IsTakeProfitValid(double price, double takeProfit, bool isBuy)
 //+------------------------------------------------------------------+
 void PlaceMarketOrder()
 {
-   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK); // Retrieve Ask price
-   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID); // Retrieve Bid price
-   double atr = CalculateATR(10);  // Calculate 10-day ATR from the daily timeframe
-   double price = OrderType == ORDER_TYPE_BUY ? ask : bid;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double atr = CalculateATR(10);
+   bool isBuy = (OrderType == ORDER_TYPE_BUY);
+   double price = isBuy ? ask : bid;
 
    double sl = StopLossPrice;
    double tp = TakeProfitPrice;
 
-   // Determine if the given stop loss price is valid
-   bool validStopLoss = IsStopLossValid(price, sl, OrderType == ORDER_TYPE_BUY);
-   if (!validStopLoss && StopLossATR > 0)
+   if (!IsStopLossValid(price, sl, isBuy) && StopLossATR > 0)
    {
-      // Calculate the stop loss using ATR if the provided stop loss is invalid or 0
-      sl = OrderType == ORDER_TYPE_BUY ? price - (atr * StopLossATR) : price + (atr * StopLossATR);
-      validStopLoss = IsStopLossValid(price, sl, OrderType == ORDER_TYPE_BUY);
-      if (!validStopLoss) sl = 0; // If still invalid, don't use any stop loss
+      sl = isBuy ? price - (atr * StopLossATR) : price + (atr * StopLossATR);
+      if (!IsStopLossValid(price, sl, isBuy)) sl = 0;
    }
 
-   // Determine if the given take profit price is valid
-   bool validTakeProfit = IsTakeProfitValid(price, tp, OrderType == ORDER_TYPE_BUY);
-   if (!validTakeProfit && TakeProfitATR > 0)
+   if (!IsTakeProfitValid(price, tp, isBuy) && TakeProfitATR > 0)
    {
-      // Calculate the take profit using ATR if the provided take profit is invalid or 0
-      tp = OrderType == ORDER_TYPE_BUY ? price + (atr * TakeProfitATR) : price - (atr * TakeProfitATR);
-      validTakeProfit = IsTakeProfitValid(price, tp, OrderType == ORDER_TYPE_BUY);
-      if (!validTakeProfit) tp = 0; // If still invalid, don't use any take profit
+      tp = isBuy ? price + (atr * TakeProfitATR) : price - (atr * TakeProfitATR);
+      if (!IsTakeProfitValid(price, tp, isBuy)) tp = 0;
    }
 
-   // Place market order based on the selected order type
-   if (OrderType == ORDER_TYPE_BUY)
-   {
-      trade.Buy(OrderLots, Symbol(), 0.0, sl, tp, "Queued Buy Market Order");
-   }
-   else if (OrderType == ORDER_TYPE_SELL)
-   {
-      trade.Sell(OrderLots, Symbol(), 0.0, sl, tp, "Queued Sell Market Order");
-   }
+   if (isBuy)
+      trade.Buy(OrderLots, _Symbol, 0.0, sl, tp, "Queued Buy Market Order");
+   else
+      trade.Sell(OrderLots, _Symbol, 0.0, sl, tp, "Queued Sell Market Order");
 
    if (trade.ResultRetcode() == TRADE_RETCODE_DONE)
    {

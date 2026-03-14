@@ -23,31 +23,14 @@
  **/
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.29"
-double LastBullPower = -1;
-double LastBearPower = -1;
-datetime LastPowerNotification = 0;
-const int NotificationCoolDown = 1200;
+#property version   "1.30"
 double LastBullPowerHTF = -1;
 double LastBearPowerHTF = -1;
 double LastBullPowerLTF = -1;
 double LastBearPowerLTF = -1;
-double CurrentBullPowerLTF = 0;
-double CurrentBearPowerLTF = 0;
-double VerifiedBullPowerLTF1 = -1;
-double VerifiedBearPowerLTF1 = -1;
-double VerifiedBullPowerLTF2 = -1;
-double VerifiedBearPowerLTF2 = -1;
-double VerifiedBullPowerLTF3 = -1;
-double VerifiedBearPowerLTF3 = -1;
-double CurrentBullPowerHTF = 0;
-double CurrentBearPowerHTF = 0;
-double VerifiedBullPowerHTF1 = -1;
-double VerifiedBearPowerHTF1 = -1;
-double VerifiedBullPowerHTF2 = -1;
-double VerifiedBearPowerHTF2 = -1;
-double VerifiedBullPowerHTF3 = -1;
-double VerifiedBearPowerHTF3 = -1;
+datetime LastPowerNotification = 0;
+const int NotificationCoolDown = 1200;
+const int MaxVerifyAttempts = 10;
 input string AgricultureAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string CryptoAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string EnergyAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
@@ -55,141 +38,117 @@ input string ForexAPIKey = "https://discord.com/api/webhooks/your_webhook_id/you
 input string IndicesAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string MetalAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string StocksAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
+// Symbol-to-sector lookup arrays
+string EnergySymbols[]     = {"USOUSD", "UKOUSD", "NATGAS.f"};
+string CryptoSymbols[]     = {"BTCUSD", "LINKUSD", "BCHUSD", "ETHUSD", "AVAXUSD", "LTCUSD",
+                              "XRPUSD", "MATICUSD", "SOLUSD", "UNIUSD", "ICPUSD", "FILUSD",
+                              "DOTUSD", "DOGEUSD", "VETUSD", "BNBUSD", "TRXUSD", "ADAUSD",
+                              "XLMUSD", "DASHUSD", "XMRUSD"};
+string MetalSymbols[]      = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"};
+string ForexSymbols[]      = {"AUDCAD.i", "AUDCHF.i", "AUDJPY.i", "AUDUSD.i", "CADCHF.i", "CADJPY.i", "CHFJPY.i",
+                              "EURAUD.i", "EURCAD.i", "EURCHF.i", "EURGBP.i", "EURJPY.i", "EURUSD.i", "GBPAUD.i",
+                              "GBPCAD.i", "GBPCHF.i", "GBPJPY.i", "GBPUSD.i", "USDCAD.i", "USDCHF.i", "USDJPY.i"};
+string IndicesSymbols[]    = {"NDX100", "SPX500", "US30", "UK100", "GER30", "ASX200", "SPN35",
+                              "EUSTX50", "FRA40", "JPN225", "HK50", "USDX", "US2000.cash", "USTN10.f"};
+string AgricultureSymbols[]= {"CORN.c", "COCOA.c", "COFFEE.c", "SOYBEAN.c", "WHEAT.c"};
+string StocksSymbols[]     = {"AAPL", "AMZN", "BABA", "BAC", "FB", "GOOG", "META", "MSFT",
+                              "NFLX", "NVDA", "PFE", "RACE", "T", "TSLA", "V", "WMT",
+                              "ZM", "ALVG", "BAYGn", "AIRF", "DBKGn", "VOWG_p", "IBE", "LVMH"};
 int OnInit()
 {
    return(INIT_SUCCEEDED);
 }
-string arrayToString(uchar &arr[])
+bool IsSymbolInArray(const string &arr[], string sym)
 {
-   string result = "";
    for(int i = 0; i < ArraySize(arr); i++)
+      if(arr[i] == sym) return true;
+   return false;
+}
+string GetWebhookURL()
+{
+   if(IsSymbolInArray(EnergySymbols, _Symbol))      return EnergyAPIKey;
+   if(IsSymbolInArray(CryptoSymbols, _Symbol))      return CryptoAPIKey;
+   if(IsSymbolInArray(MetalSymbols, _Symbol))       return MetalAPIKey;
+   if(IsSymbolInArray(ForexSymbols, _Symbol))       return ForexAPIKey;
+   if(IsSymbolInArray(IndicesSymbols, _Symbol))     return IndicesAPIKey;
+   if(IsSymbolInArray(AgricultureSymbols, _Symbol)) return AgricultureAPIKey;
+   if(IsSymbolInArray(StocksSymbols, _Symbol))      return StocksAPIKey;
+   return "";
+}
+bool ReadAndVerifyPower(double &bullHTF, double &bearHTF, double &bullLTF, double &bearLTF)
+{
+   if(!GlobalVariableCheck("GlobalBullPowerLTF") && !GlobalVariableCheck("GlobalBearPowerLTF") &&
+      !GlobalVariableCheck("GlobalBullPowerHTF") && !GlobalVariableCheck("GlobalBearPowerHTF"))
+      return false;
+   int sleepDuration = 31337 + MathRand() % 7777;
+   // Read initial values
+   bullHTF = GlobalVariableGet("GlobalBullPowerHTF");
+   bearHTF = GlobalVariableGet("GlobalBearPowerHTF");
+   bullLTF = GlobalVariableGet("GlobalBullPowerLTF");
+   bearLTF = GlobalVariableGet("GlobalBearPowerLTF");
+   // Verify with 3 consecutive reads
+   for(int attempt = 0; attempt < MaxVerifyAttempts; attempt++)
    {
-      result += IntegerToString(arr[i], 16) + " ";  // Using hex representation
+      bool verified = true;
+      for(int v = 0; v < 3; v++)
+      {
+         Sleep(sleepDuration);
+         if(GlobalVariableGet("GlobalBullPowerHTF") != bullHTF ||
+            GlobalVariableGet("GlobalBearPowerHTF") != bearHTF ||
+            GlobalVariableGet("GlobalBullPowerLTF") != bullLTF ||
+            GlobalVariableGet("GlobalBearPowerLTF") != bearLTF)
+         {
+            // Values changed, re-read and restart verification
+            bullHTF = GlobalVariableGet("GlobalBullPowerHTF");
+            bearHTF = GlobalVariableGet("GlobalBearPowerHTF");
+            bullLTF = GlobalVariableGet("GlobalBullPowerLTF");
+            bearLTF = GlobalVariableGet("GlobalBearPowerLTF");
+            verified = false;
+            break;
+         }
+      }
+      double powerCalc = GlobalVariableGet("PowerCalcComplete");
+      if(verified && powerCalc == 1.0)
+         return true;
    }
-   return result;
+   return false;
 }
 void SendPowerNotification()
 {
-   double PowerCalculated = GlobalVariableGet("PowerCalcComplete");
-   if(GlobalVariableCheck("GlobalBullPowerLTF") || GlobalVariableCheck("GlobalBearPowerLTF") || GlobalVariableCheck("GlobalBullPowerHTF") || GlobalVariableCheck("GlobalBearPowerHTF"))
-   {
-      int RandomSleepDuration = 31337 + MathRand() % (7777);
-      CurrentBullPowerHTF = GlobalVariableGet("GlobalBullPowerHTF");
-      CurrentBearPowerHTF = GlobalVariableGet("GlobalBearPowerHTF");
-      CurrentBullPowerLTF = GlobalVariableGet("GlobalBullPowerLTF");
-      CurrentBearPowerLTF = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF1 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF1 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF1 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF1 = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF2 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF2 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF2 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF2 = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF3 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF3 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF3 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF3 = GlobalVariableGet("GlobalBearPowerLTF");
-      PowerCalculated = GlobalVariableGet("PowerCalcComplete");
-      while((CurrentBullPowerHTF != VerifiedBullPowerHTF1 || CurrentBullPowerHTF != VerifiedBullPowerHTF2 || CurrentBullPowerHTF != VerifiedBullPowerHTF3 || CurrentBullPowerLTF != VerifiedBullPowerLTF1 || CurrentBullPowerLTF != VerifiedBullPowerLTF2 || CurrentBullPowerLTF != VerifiedBullPowerLTF3) && PowerCalculated == true)
-      {
-      CurrentBullPowerHTF = GlobalVariableGet("GlobalBullPowerHTF");
-      CurrentBearPowerHTF = GlobalVariableGet("GlobalBearPowerHTF");
-      CurrentBullPowerLTF = GlobalVariableGet("GlobalBullPowerLTF");
-      CurrentBearPowerLTF = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF1 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF1 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF1 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF1 = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF2 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF2 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF2 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF2 = GlobalVariableGet("GlobalBearPowerLTF");
-      Sleep(RandomSleepDuration);
-      VerifiedBullPowerHTF3 = GlobalVariableGet("GlobalBullPowerHTF");
-      VerifiedBearPowerHTF3 = GlobalVariableGet("GlobalBearPowerHTF");
-      VerifiedBullPowerLTF3 = GlobalVariableGet("GlobalBullPowerLTF");
-      VerifiedBearPowerLTF3 = GlobalVariableGet("GlobalBearPowerLTF");
-      PowerCalculated = GlobalVariableGet("PowerCalcComplete");
-      }
-      PowerCalculated = GlobalVariableGet("PowerCalcComplete");
-      if((CurrentBullPowerHTF != LastBullPowerHTF || CurrentBearPowerHTF != LastBearPowerHTF || CurrentBullPowerLTF != LastBullPowerLTF || CurrentBearPowerLTF != LastBearPowerLTF) && ((CurrentBullPowerHTF + CurrentBearPowerHTF == 100) && (CurrentBullPowerLTF + CurrentBearPowerLTF == 100)) && PowerCalculated == true)
-      {
-         // Update the stored values
-         LastBullPowerHTF = CurrentBullPowerHTF;
-         LastBearPowerHTF = CurrentBearPowerHTF;
-         LastBullPowerLTF = CurrentBullPowerLTF;
-         LastBearPowerLTF = CurrentBearPowerLTF;
-         string url;
-         if ( _Symbol == "USOUSD" || _Symbol == "UKOUSD" || _Symbol == "NATGAS.f" )
-         {
-            url = EnergyAPIKey;
-         }
-         if ( _Symbol == "BTCUSD" || _Symbol == "LINKUSD" || _Symbol == "BCHUSD" || _Symbol == "ETHUSD" || _Symbol == "AVAXUSD" || _Symbol == "LTCUSD"
-         || _Symbol == "XRPUSD" || _Symbol == "MATICUSD" || _Symbol == "SOLUSD" || _Symbol == "UNIUSD" || _Symbol == "ICPUSD" || _Symbol == "FILUSD"
-         || _Symbol == "DOTUSD" || _Symbol == "DOGEUSD" || _Symbol == "VETUSD" || _Symbol == "BNBUSD" || _Symbol == "TRXUSD" || _Symbol == "ADAUSD"
-         || _Symbol == "XLMUSD" || _Symbol == "DASHUSD" || _Symbol == "XMRUSD" )
-         {
-            url = CryptoAPIKey;
-         }
-         if ( _Symbol == "XAUUSD" || _Symbol == "XAGUSD" || _Symbol == "XPTUSD" || _Symbol == "XPDUSD" )
-         {
-            url = MetalAPIKey;
-         }
-         if ( _Symbol == "AUDCAD.i" || _Symbol == "AUDCHF.i" || _Symbol == "AUDJPY.i" || _Symbol == "AUDUSD.i" || _Symbol == "CADCHF.i" || _Symbol == "CADJPY.i" || _Symbol == "CHFJPY.i"
-         || _Symbol == "EURAUD.i" || _Symbol == "EURCAD.i" || _Symbol == "EURCHF.i" || _Symbol == "EURGBP.i" || _Symbol == "EURJPY.i" || _Symbol == "EURUSD.i" || _Symbol == "GBPAUD.i"
-         || _Symbol == "GBPCAD.i" || _Symbol == "GBPCHF.i" || _Symbol == "GBPJPY.i" || _Symbol == "GBPUSD.i" || _Symbol == "USDCAD.i" || _Symbol == "USDCHF.i" || _Symbol == "USDJPY.i" )
-         {
-            url = ForexAPIKey;
-         }
-         if ( _Symbol == "NDX100" || _Symbol == "SPX500" || _Symbol == "US30" || _Symbol == "UK100" || _Symbol == "GER30" || _Symbol == "ASX200" || _Symbol == "SPN35"
-         || _Symbol == "EUSTX50" || _Symbol == "FRA40" || _Symbol == "JPN225" || _Symbol == "HK50" || _Symbol == "USDX" || _Symbol == "US2000.cash" || _Symbol == "USTN10.f" )
-         {
-            url = IndicesAPIKey;
-         }
-         if ( _Symbol == "CORN.c" || _Symbol == "COCOA.c" || _Symbol == "COFFEE.c" || _Symbol == "SOYBEAN.c" || _Symbol == "WHEAT.c" )
-         {
-            url = AgricultureAPIKey;
-         }
-         if (  _Symbol == "AAPL" || _Symbol == "AMZN" || _Symbol == "BABA" || _Symbol == "BAC" || _Symbol == "FB" || _Symbol == "GOOG" || _Symbol == "META"  || _Symbol == "MSFT"   
-         || _Symbol == "NFLX" || _Symbol == "NVDA"  || _Symbol == "PFE" || _Symbol == "RACE" || _Symbol == "T" || _Symbol == "TSLA" || _Symbol == "V" || _Symbol == "WMT"  
-         || _Symbol == "ZM" || _Symbol == "ALVG" || _Symbol == "BAYGn" || _Symbol == "AIRF" || _Symbol == "DBKGn" || _Symbol == "VOWG_p" || _Symbol == "IBE" || _Symbol == "LVMH" )
-         {
-            url = StocksAPIKey;
-         }
-         string headers = "Content-Type: application/json";
-         uchar result[];
-         string result_headers;
-         string PowerText = "[" + _Symbol + "] [LTF Bull Power " + DoubleToString(CurrentBullPowerLTF, 0) + "]" + " [LTF Bear Power " + DoubleToString(CurrentBearPowerLTF, 0)+ "]" + 
-          " [HTF Bull Power " + DoubleToString(CurrentBullPowerHTF, 0) + "]" + " [HTF Bear Power " + DoubleToString(CurrentBearPowerHTF, 0)+ "]";
-         string json = "{\"content\":\""+PowerText+"\"}";
-         char jsonArray[];
-         StringToCharArray(json, jsonArray);
-         // Remove null-terminator if any
-         int arrSize = ArraySize(jsonArray);
-         if(jsonArray[arrSize - 1] == '\0')
-         {
-            ArrayResize(jsonArray, arrSize - 1);
-         }
-         int res = WebRequest("POST", url, headers, 10, jsonArray, result, result_headers);
-         string resultString = CharArrayToString(result);
-         LastPowerNotification = TimeCurrent();
-      }
-   }
+   double bullHTF, bearHTF, bullLTF, bearLTF;
+   if(!ReadAndVerifyPower(bullHTF, bearHTF, bullLTF, bearLTF))
+      return;
+   // Validate power values sum to 100
+   if((bullHTF + bearHTF != 100) || (bullLTF + bearLTF != 100))
+      return;
+   // Check if values actually changed
+   if(bullHTF == LastBullPowerHTF && bearHTF == LastBearPowerHTF &&
+      bullLTF == LastBullPowerLTF && bearLTF == LastBearPowerLTF)
+      return;
+   string url = GetWebhookURL();
+   if(url == "") return;
+   // Update stored values
+   LastBullPowerHTF = bullHTF;
+   LastBearPowerHTF = bearHTF;
+   LastBullPowerLTF = bullLTF;
+   LastBearPowerLTF = bearLTF;
+   string PowerText = StringFormat("[%s] [LTF Bull Power %.0f] [LTF Bear Power %.0f] [HTF Bull Power %.0f] [HTF Bear Power %.0f]",
+                                   _Symbol, bullLTF, bearLTF, bullHTF, bearHTF);
+   string json = "{\"content\":\"" + PowerText + "\"}";
+   char jsonArray[];
+   StringToCharArray(json, jsonArray);
+   // Remove null-terminator
+   int arrSize = ArraySize(jsonArray);
+   if(arrSize > 0 && jsonArray[arrSize - 1] == '\0')
+      ArrayResize(jsonArray, arrSize - 1);
+   string headers = "Content-Type: application/json";
+   uchar result[];
+   string result_headers;
+   WebRequest("POST", url, headers, 10, jsonArray, result, result_headers);
+   LastPowerNotification = TimeCurrent();
 }
 void OnTick()
 {
    if(TimeCurrent() - LastPowerNotification >= NotificationCoolDown)
-   {
       SendPowerNotification();
-   }
 }
-//Print("Debug - HTTP response code: ", res);
-//Print("Debug - Result: ", resultString);
-//Print("Debug - JSON as uchar array: ", arrayToString(jsonArray));
-//Print("Debug - Length of Result: ", StringLen(resultString));

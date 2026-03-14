@@ -1,5 +1,20 @@
+#!/usr/bin/env python3
+"""
+ExportScrub.py — Enrich ExportSymbols CSV with Yahoo Finance monthly volume data.
+
+Usage:
+    python3 ExportScrub.py [input.csv]
+
+If no argument is given, prompts for the filename interactively.
+Output: input-YAPI_Volume.csv with a Volume column added.
+"""
+
+import sys
+import os
 import pandas as pd
 import yfinance as yf
+
+
 def fetch_monthly_volumes(symbols):
     """
     Fetch the latest monthly trading volume for multiple symbols.
@@ -27,6 +42,8 @@ def fetch_monthly_volumes(symbols):
     except Exception as e:
         print(f"Error fetching data for symbols: {e}")
         return None
+
+
 def main(input_csv_path, output_csv_path):
     """
     Read the CSV file, fetch monthly volumes for all symbols, and save the updated CSV.
@@ -51,15 +68,10 @@ def main(input_csv_path, output_csv_path):
     if 'Volume' not in df.columns:
         df['Volume'] = None
     print(f"Fetching volumes for {len(symbols)} symbols...")
-    # Fetch volumes for all symbols at once
     try:
         volumes = fetch_monthly_volumes(symbols)
         if volumes is not None:
-            # Update the dataframe with fetched volumes
-            for index, row in df.iterrows():
-                symbol = row['Symbol']
-                if symbol in volumes:
-                    df.loc[index, 'Volume'] = volumes[symbol]
+            df['Volume'] = df['Symbol'].map(volumes)
     except Exception as e:
         print(f"Error processing symbols: {str(e)}")
     # Save the updated dataframe to a new CSV file
@@ -68,10 +80,18 @@ def main(input_csv_path, output_csv_path):
         print(f"Updated volumes saved successfully to: {output_csv_path}")
     except Exception as e:
         print(f"Error saving the updated data: {e}")
+
+
 if __name__ == "__main__":
-    # Get input filename from user
-    input_filename = input("Please enter your CSV filename (including .csv extension): ")
-    # Generate output filename
-    base, extension = input_filename.rsplit('.', 1)
-    output_filename = f"{base}-YAPI_Volume.{extension}"
+    if len(sys.argv) > 1:
+        input_filename = sys.argv[1]
+    else:
+        input_filename = input("Please enter your CSV filename (including .csv extension): ")
+
+    if not os.path.exists(input_filename):
+        print(f"File not found: {input_filename}")
+        sys.exit(1)
+
+    base, extension = os.path.splitext(input_filename)
+    output_filename = f"{base}-YAPI_Volume{extension}"
     main(input_filename, output_filename)

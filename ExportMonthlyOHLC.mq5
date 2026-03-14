@@ -52,12 +52,6 @@ void OnStart()
       // Filter to stocks if requested
       if (ExportStocksOnly)
       {
-         ENUM_SYMBOL_CALC_MODE calcMode = (ENUM_SYMBOL_CALC_MODE)SymbolInfoInteger(symbol, SYMBOL_TRADE_CALC_MODE);
-         // Stock CFDs use SYMBOL_CALC_MODE_CFDLEVERAGE or SYMBOL_CALC_MODE_CFD
-         // Also check sector — stocks have sector info, forex/crypto/indices don't
-         string sector = "";
-         // Try to detect stock symbols: they typically have sector/industry info
-         // or their calc mode indicates stock-like instruments
          long sector_id = SymbolInfoInteger(symbol, SYMBOL_SECTOR);
          if (sector_id == SECTOR_UNDEFINED || sector_id == SECTOR_CURRENCY ||
              sector_id == SECTOR_CURRENCY_CRYPTO || sector_id == SECTOR_INDEXES ||

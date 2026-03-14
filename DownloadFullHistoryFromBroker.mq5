@@ -44,59 +44,46 @@ string TimeframeToString(ENUM_TIMEFRAMES timeframe)
 bool EnsureFullHistory(const string symbol, const ENUM_TIMEFRAMES timeframe)
 {
    string tf_str = TimeframeToString(timeframe);
- //  PrintFormat("Downloading full history for symbol: %s on timeframe: %s", symbol, tf_str);
-   // Define an array to store historical data
    MqlRates rates[];
-   // Set start and end times to cover the maximum range
-   datetime start_time = D'1970.01.01 00:00'; // Earliest possible time
-   datetime end_time   = TimeCurrent();      // Current server time
-   // Request all available bars
+   datetime start_time = D'1970.01.01 00:00';
+   datetime end_time   = TimeCurrent();
    int bars = CopyRates(symbol, timeframe, start_time, end_time, rates);
-   // Check if the data was successfully downloaded
    if (bars > 0)
    {
       PrintFormat("Downloaded %d bars for symbol: %s on timeframe: %s", bars, symbol, tf_str);
-      return true; // Success
+      return true;
    }
    else
    {
       PrintFormat("Failed to download data for symbol: %s on timeframe: %s", symbol, tf_str);
-      return false; // Failure
+      return false;
    }
 }
 void OnStart()
 {
-   // List of timeframes to download
    ENUM_TIMEFRAMES timeframes[] = {PERIOD_D1, PERIOD_W1, PERIOD_MN1};
-   // Total symbols available
    int total_symbols = SymbolsTotal(false);
    int success_count = 0;
    int failure_count = 0;
    string failed_symbols = "";
    PrintFormat("Total symbols available from broker: %d", total_symbols);
-   // Loop through all symbols
    for (int i = 0; i < total_symbols; i++)
    {
       string symbol = SymbolName(i, false);
       if (symbol != "")
       {
-         // Loop through each timeframe
          for (int t = 0; t < ArraySize(timeframes); t++)
          {
-            ENUM_TIMEFRAMES timeframe = timeframes[t];
-            string tf_str = TimeframeToString(timeframe);
-   //         PrintFormat("Downloading data for %s on timeframe: %s", symbol, tf_str);
-            if (EnsureFullHistory(symbol, timeframe))
+            if (EnsureFullHistory(symbol, timeframes[t]))
                success_count++;
             else
             {
                failure_count++;
-               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, tf_str);
+               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, TimeframeToString(timeframes[t]));
             }
          }
       }
    }
-   // Print summary
    PrintFormat("Full historical data download completed.");
    PrintFormat("Total symbols processed: %d", total_symbols);
    PrintFormat("Successfully downloaded data for %d timeframes.", success_count);

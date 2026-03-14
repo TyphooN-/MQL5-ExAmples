@@ -15,7 +15,6 @@ import pandas as pd
 import yfinance as yf
 import sys
 import os
-from datetime import datetime
 
 # Threshold for flagging a month as anomalous (ratio divergence from recent baseline)
 RATIO_THRESHOLD = 0.20  # 20% deviation flags an anomaly
@@ -107,8 +106,8 @@ def compare_symbol(symbol, darwinex_df):
         'Deviation_Pct': round(anomaly_pct, 1),
         'Recent_Ratio': round(recent_ratio, 4),
         'Anomaly_Ratio': round(worst_ratio, 4),
-        'Sector': darwinex_df[darwinex_df['Symbol'] == symbol]['Sector'].iloc[0] if 'Sector' in darwinex_df.columns else '',
-        'Industry': darwinex_df[darwinex_df['Symbol'] == symbol]['Industry'].iloc[0] if 'Industry' in darwinex_df.columns else '',
+        'Sector': dwx['Sector'].iloc[0] if 'Sector' in dwx.columns else '',
+        'Industry': dwx['Industry'].iloc[0] if 'Industry' in dwx.columns else '',
     }
 
 

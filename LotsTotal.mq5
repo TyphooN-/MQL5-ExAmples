@@ -23,53 +23,35 @@
  **/
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.info"
-#property version   "1.001"
+#property version   "1.002"
 #property indicator_chart_window
 #property strict
-double GetTotalLongVolumeForSymbol(string symbol)
+void GetVolumesForSymbol(string symbol, double &longVol, double &shortVol)
 {
-   double totalVolume = 0;
-   for(int i=PositionsTotal()-1; i >= 0; i--)
+   longVol = 0;
+   shortVol = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      string positionSymbol = PositionGetSymbol(i);
-      if(positionSymbol == symbol && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-      {
-         totalVolume += PositionGetDouble(POSITION_VOLUME);
-      }
+      if(PositionGetSymbol(i) != symbol) continue;
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         longVol += volume;
+      else
+         shortVol += volume;
    }
-   return totalVolume;
-}
-double GetTotalShortVolumeForSymbol(string symbol)
-{
-   double totalVolume = 0;
-
-   for(int i=PositionsTotal()-1; i >= 0; i--)
-   {
-      string positionSymbol = PositionGetSymbol(i);
-      if(positionSymbol == symbol && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-      {
-         totalVolume += PositionGetDouble(POSITION_VOLUME);
-      }
-   }
-   return totalVolume;
-}
-double GetTotalVolumeForSymbol(string symbol)
-{
-   return GetTotalLongVolumeForSymbol(symbol) + GetTotalShortVolumeForSymbol(symbol);
 }
 int OnInit()
 {
-   double totalLotsLong = GetTotalLongVolumeForSymbol(_Symbol);
-   double totalLotsShort = GetTotalShortVolumeForSymbol(_Symbol);
+   double totalLotsLong, totalLotsShort;
+   GetVolumesForSymbol(_Symbol, totalLotsLong, totalLotsShort);
    Print("Total Lots Long for ", _Symbol, ": ", totalLotsLong);
    Print("Total Lots Short for ", _Symbol, ": ", totalLotsShort);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double priceChangeLong = totalLotsLong * tickSize;
-   double priceChangeShort = totalLotsShort * tickSize;
-   double totalPriceChange = priceChangeLong - priceChangeShort;
-   Print("Price Change per Tick (Long): ", priceChangeLong);
-   Print("Price Change per Tick (Short): ", priceChangeShort);
-   Print("Total Price Change per Tick (Long - Short): ", totalPriceChange);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double plPerTickLong = totalLotsLong * tickValue;
+   double plPerTickShort = totalLotsShort * tickValue;
+   Print("P/L per Tick (Long): ", plPerTickLong);
+   Print("P/L per Tick (Short): ", plPerTickShort);
+   Print("Net P/L per Tick (Long - Short): ", plPerTickLong - plPerTickShort);
    return(INIT_SUCCEEDED);
 }
 int OnCalculate(const int rates_total,

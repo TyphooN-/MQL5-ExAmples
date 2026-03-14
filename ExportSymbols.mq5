@@ -27,16 +27,12 @@
 #property description "TyphooN's CSV Symbol Exporter"
 #property strict
 #include <Darwinex/DWEX Portfolio Risk Man.mqh>
-// Instantiate the portfolio risk manager
-CPortfolioRiskMan portfolioRiskMan(PERIOD_D1, 20);  // Example: Using daily timeframe and 20 periods for StdDev
-// Input parameter for optional user-specified CSV file path
-input string UserCSVFilePath = "";
-// Variable to hold the actual file path used for export
+CPortfolioRiskMan portfolioRiskMan(PERIOD_D1, 20);
 string CSVFilePath;
 int OnInit()
 {
    string server_name = AccountInfoString(ACCOUNT_SERVER);
-   string server_date = TimeToString(TimeCurrent(), TIME_DATE); // Only the date
+   string server_date = TimeToString(TimeCurrent(), TIME_DATE);
    string server_type = "";
    if (SymbolInfoDouble("USDMXN", SYMBOL_BID) > 0) {
      server_type = "CFD";
@@ -44,7 +40,7 @@ int OnInit()
    else if (SymbolInfoDouble("ES_U", SYMBOL_BID) > 0 || SymbolInfoDouble("ES_Z", SYMBOL_BID) > 0) {
      server_type = "Futures";
    }
-   else if (SymbolInfoDouble("BTCUSD", SYMBOL_BID) > 0 || SymbolInfoDouble("BTCUSD", SYMBOL_BID) > 0) {
+   else if (SymbolInfoDouble("BTCUSD", SYMBOL_BID) > 0 || SymbolInfoDouble("ETHUSD", SYMBOL_BID) > 0) {
      server_type = "Crypto";
    }
    else
@@ -53,9 +49,7 @@ int OnInit()
    }
    CSVFilePath = StringFormat("SymbolsExport-%s-%s-%s.csv", server_name, server_type, server_date);
    Print("Exporting symbols to file: ", CSVFilePath);
-   // Call the function to export symbols to CSV
    ExportSymbolsToCSV();
-   // Terminate the indicator after initialization
    return(INIT_SUCCEEDED);
 }
 //+------------------------------------------------------------------+
@@ -138,13 +132,18 @@ public:
         industry_name = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
         
         double atr_values_d[], atr_values_w[], atr_values_m[];
-        if(CopyBuffer(iATR(symbol, PERIOD_D1, 14), 0, 1, 1, atr_values_d) > 0) atr_daily = atr_values_d[0]; else atr_daily = 0;
-        if(CopyBuffer(iATR(symbol, PERIOD_W1, 14), 0, 1, 1, atr_values_w) > 0) atr_weekly = atr_values_w[0]; else atr_weekly = 0;
-        if(CopyBuffer(iATR(symbol, PERIOD_MN1, 14), 0, 1, 1, atr_values_m) > 0) atr_monthly = atr_values_m[0]; else atr_monthly = 0;
+        int hD = iATR(symbol, PERIOD_D1, 14);
+        int hW = iATR(symbol, PERIOD_W1, 14);
+        int hM = iATR(symbol, PERIOD_MN1, 14);
+        atr_daily   = (hD != INVALID_HANDLE && CopyBuffer(hD, 0, 1, 1, atr_values_d) > 0) ? atr_values_d[0] : 0;
+        atr_weekly  = (hW != INVALID_HANDLE && CopyBuffer(hW, 0, 1, 1, atr_values_w) > 0) ? atr_values_w[0] : 0;
+        atr_monthly = (hM != INVALID_HANDLE && CopyBuffer(hM, 0, 1, 1, atr_values_m) > 0) ? atr_values_m[0] : 0;
+        if(hD != INVALID_HANDLE) IndicatorRelease(hD);
+        if(hW != INVALID_HANDLE) IndicatorRelease(hW);
+        if(hM != INVALID_HANDLE) IndicatorRelease(hM);
     }
 };
 
-// Function to export symbols to CSV
 void ExportSymbolsToCSV()
 {
     int file_handle = FileOpen(CSVFilePath, FILE_WRITE | FILE_CSV | FILE_ANSI);
@@ -157,13 +156,14 @@ void ExportSymbolsToCSV()
     FileWriteString(file_handle, "Symbol;BaseCurrency;QuoteCurrency;Description;Digits;Point;Spread;TickSize;TickValue;TradeContractSize;TradeMode;TradeExecutionMode;VolumeMin;VolumeMax;VolumeStep;MarginInitial;MarginMaintenance;MarginHedged;MarginCurrency;StartDate;ExpirationDate;SwapLong;SwapShort;SwapType;Swap3Days;TradeSessions;VaR_1_Lot;BidPrice;AskPrice;SectorName;IndustryName;ATR_D1;ATR_W1;ATR_MN1\n");
 
     int total_symbols = SymbolsTotal(false);
-    int batch_size = 100; // Process 100 symbols at a time
+    int batch_size = 100;
 
     for (int i = 0; i < total_symbols; i += batch_size)
     {
         CSymbolInfo* symbols_data[];
         int current_batch_size = MathMin(batch_size, total_symbols - i);
         ArrayResize(symbols_data, current_batch_size);
+        ArrayInitialize(symbols_data, NULL);
 
         for (int j = 0; j < current_batch_size; j++)
         {
@@ -193,7 +193,6 @@ void ExportSymbolsToCSV()
             FileWriteString(file_handle, line);
         }
 
-        // Clear the data for the current batch
         for (int j = 0; j < current_batch_size; j++)
         {
             if (CheckPointer(symbols_data[j]) != POINTER_INVALID)
@@ -208,7 +207,6 @@ void ExportSymbolsToCSV()
     Print("ExportSymbols EA removed from chart.");
     ExpertRemove();
 }
-// Function to get the trade session information as a formatted string
 string GetTradeSessions(string symbol)
 {
    string result = "";
@@ -226,5 +224,6 @@ string GetTradeSessions(string symbol)
          }
       }
    }
+   StringTrimRight(result);
    return result;
 }
