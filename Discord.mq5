@@ -51,7 +51,7 @@ string ForexSymbols[]      = {"AUDCAD.i", "AUDCHF.i", "AUDJPY.i", "AUDUSD.i", "C
 string IndicesSymbols[]    = {"NDX100", "SPX500", "US30", "UK100", "GER30", "ASX200", "SPN35",
                               "EUSTX50", "FRA40", "JPN225", "HK50", "USDX", "US2000.cash", "USTN10.f"};
 string AgricultureSymbols[]= {"CORN.c", "COCOA.c", "COFFEE.c", "SOYBEAN.c", "WHEAT.c"};
-string StocksSymbols[]     = {"AAPL", "AMZN", "BABA", "BAC", "FB", "GOOG", "META", "MSFT",
+string StocksSymbols[]     = {"AAPL", "AMZN", "BABA", "BAC", "GOOG", "META", "MSFT",
                               "NFLX", "NVDA", "PFE", "RACE", "T", "TSLA", "V", "WMT",
                               "ZM", "ALVG", "BAYGn", "AIRF", "DBKGn", "VOWG_p", "IBE", "LVMH"};
 int OnInit()

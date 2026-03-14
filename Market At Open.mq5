@@ -24,6 +24,7 @@
 #property copyright "TyphooN"
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.00"
+#property strict
 #include <Trade\Trade.mqh>
 
 input ENUM_ORDER_TYPE OrderType = ORDER_TYPE_BUY; // Order type (Buy/Sell)

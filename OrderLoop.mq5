@@ -7,6 +7,10 @@
  * (at your option) any later version.
  *
  **/
+#property copyright "TyphooN"
+#property link      "https://www.marketwizardry.org/"
+#property version   "1.00"
+#property strict
 #include <Trade\Trade.mqh>
 input double Lots = 1000;              // Lots per order
 input double TotalLotsToSell = 21000;  // Total lots to sell
