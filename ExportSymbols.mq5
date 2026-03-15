@@ -158,7 +158,6 @@ void ExportSymbolsToCSV()
         CSymbolInfo* symbols_data[];
         int current_batch_size = MathMin(batch_size, total_symbols - i);
         ArrayResize(symbols_data, current_batch_size);
-        ArrayInitialize(symbols_data, NULL);
 
         for (int j = 0; j < current_batch_size; j++)
         {
