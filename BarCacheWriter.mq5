@@ -122,6 +122,30 @@ void ExportAll()
    // Begin transaction for bulk insert (much faster than individual inserts)
    DatabaseExecute(g_db, "BEGIN TRANSACTION");
 
+   // Write symbol list to a special key so TyphooN-Terminal can discover all symbols
+   string symListJson = "[";
+   for(int si = 0; si < symCount; si++)
+   {
+      string s = SymbolName(si, MarketWatchOnly);
+      if(StringLen(s) == 0) continue;
+      if(si > 0) symListJson += ",";
+      symListJson += "\"" + s + "\"";
+   }
+   symListJson += "]";
+   {
+      int req = DatabasePrepare(g_db,
+         "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+      if(req != INVALID_HANDLE)
+      {
+         DatabaseBind(req, 0, "mt5:__SYMBOLS__");
+         DatabaseBind(req, 1, symListJson);
+         DatabaseBind(req, 2, (long)TimeCurrent());
+         DatabaseBind(req, 3, (long)symCount);
+         DatabaseRead(req);
+         DatabaseFinalize(req);
+      }
+   }
+
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
