@@ -164,13 +164,17 @@ void ExportAll()
 
    DatabaseExecute(g_db, "COMMIT");
 
-   // Log periodically
+   // Log on first run + periodically
    static datetime lastLog = 0;
-   if(TimeCurrent() - lastLog > 300)
+   static bool firstRun = true;
+   if(firstRun || TimeCurrent() - lastLog > 300)
    {
       PrintFormat("BarCacheWriter: %d symbols × %d TFs = %d entries, %d total bars",
          symCount, ArraySize(g_timeframes), exported, totalBars);
+      if(exported == 0 && firstRun)
+         PrintFormat("BarCacheWriter: WARNING — 0 entries exported! Check Experts tab for errors.");
       lastLog = TimeCurrent();
+      firstRun = false;
    }
 }
 
@@ -189,10 +193,10 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
    }
    if(copied <= 0) return 0;
 
-   // Build JSON array of bars
-   // Format: [{"t":"2026-03-20T16:00:00Z","o":1.2345,"h":1.2350,"l":1.2340,"c":1.2348,"v":1234}, ...]
-   string json = "[";
+   // Build JSON array of bars in chunks to avoid MQL5 string size limits.
+   // MQL5 strings can handle ~16MB but StringFormat has a smaller buffer.
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   string json = "[";
 
    for(int i = 0; i < copied; i++)
    {
@@ -200,43 +204,49 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
 
       MqlDateTime mdt;
       TimeToStruct(rates[i].time, mdt);
-      string ts = StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ",
-         mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
 
-      json += StringFormat("{\"timestamp\":\"%s\",\"open\":%s,\"high\":%s,\"low\":%s,\"close\":%s,\"volume\":%d}",
-         ts,
-         DoubleToString(rates[i].open, digits),
-         DoubleToString(rates[i].high, digits),
-         DoubleToString(rates[i].low, digits),
-         DoubleToString(rates[i].close, digits),
-         rates[i].tick_volume);
+      // Build each bar manually (avoid StringFormat buffer limits)
+      json += "{\"timestamp\":\"";
+      json += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ", mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
+      json += "\",\"open\":";
+      json += DoubleToString(rates[i].open, digits);
+      json += ",\"high\":";
+      json += DoubleToString(rates[i].high, digits);
+      json += ",\"low\":";
+      json += DoubleToString(rates[i].low, digits);
+      json += ",\"close\":";
+      json += DoubleToString(rates[i].close, digits);
+      json += ",\"volume\":";
+      json += IntegerToString(rates[i].tick_volume);
+      json += "}";
    }
    json += "]";
 
-   // Upsert into SQLite
+   // Upsert via prepared statement (always — avoids SQL injection from JSON content)
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
    long timestamp = (long)TimeCurrent();
 
-   string sql = StringFormat(
-      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES ('%s', '%s', %d, %d)",
-      key, json, timestamp, copied);
-
-   if(!DatabaseExecute(g_db, sql))
+   int req = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   if(req == INVALID_HANDLE)
    {
-      // JSON might contain single quotes — use parameterized approach
-      // Fall back to prepare/bind
-      int req = DatabasePrepare(g_db,
-         "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-      if(req != INVALID_HANDLE)
-      {
-         DatabaseBind(req, 0, key);
-         DatabaseBind(req, 1, json);
-         DatabaseBind(req, 2, timestamp);
-         DatabaseBind(req, 3, (long)copied);
-         DatabaseRead(req); // execute
-         DatabaseFinalize(req);
-      }
+      PrintFormat("BarCacheWriter: prepare failed for %s (error %d, json len=%d)",
+         key, GetLastError(), StringLen(json));
+      return 0;
    }
+
+   if(!DatabaseBind(req, 0, key))
+      { PrintFormat("BarCacheWriter: bind 0 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+   if(!DatabaseBind(req, 1, json))
+      { PrintFormat("BarCacheWriter: bind 1 failed: %d (json len=%d)", GetLastError(), StringLen(json)); DatabaseFinalize(req); return 0; }
+   if(!DatabaseBind(req, 2, timestamp))
+      { PrintFormat("BarCacheWriter: bind 2 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+   if(!DatabaseBind(req, 3, (long)copied))
+      { PrintFormat("BarCacheWriter: bind 3 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+
+   // Execute the INSERT (DatabaseRead returns false for non-SELECT, which is expected)
+   DatabaseRead(req);
+   DatabaseFinalize(req);
 
    return copied;
 }
