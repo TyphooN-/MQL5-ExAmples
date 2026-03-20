@@ -23,26 +23,32 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.000"
+#property version   "1.100"
 #property description "Writes bar data directly to SQLite database using MQL5 native DatabaseOpen."
-#property description "Shares cache with TyphooN-Terminal — zero CSV, zero file IPC."
-#property description "DB location: MQL5/Files/typhoon_mt5_cache.db"
-#property description "TyphooN-Terminal reads this DB via Rust (full filesystem access to Wine paths)."
+#property description "v1.100: Incremental mode — only exports symbols/TFs that have new bars."
+#property description "Full export runs ONCE on init, then only updates changed data."
 #property strict
 
-input int    UpdateIntervalSec = 10;     // Update interval (seconds)
-input bool   MaxBars           = true;   // true = export ALL available bars
-input int    MaxBarsOverride   = 0;      // >0 overrides with fixed limit
+input int    UpdateIntervalSec = 30;     // Update interval (seconds) — 30s default to reduce I/O
+input int    BarsPerTF         = 500;    // Bars per timeframe on incremental updates (recent only)
+input int    FullExportBars    = 0;      // Full export bar count (0 = max history, only on first run)
 input bool   MarketWatchOnly   = true;   // true = Market Watch only
 
 // DB handle
 int g_db = INVALID_HANDLE;
+
+// Track last bar time per symbol:TF to skip unchanged data
+string g_lastBarKeys[];    // "SYMBOL:TF" keys
+datetime g_lastBarTimes[]; // last bar timestamp per key
+int g_trackCount = 0;
 
 // Timeframes: MN1 first (most useful immediately)
 ENUM_TIMEFRAMES g_timeframes[] = {
    PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
    PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
+
+bool g_fullExportDone = false;  // only do full export once
 
 string TFToStr(ENUM_TIMEFRAMES tf)
 {
@@ -61,22 +67,30 @@ string TFToStr(ENUM_TIMEFRAMES tf)
    return "Unknown";
 }
 
+// Find or create tracking slot for a symbol:TF pair
+int GetTrackIndex(string key)
+{
+   for(int i = 0; i < g_trackCount; i++)
+      if(g_lastBarKeys[i] == key) return i;
+   // New entry
+   g_trackCount++;
+   ArrayResize(g_lastBarKeys, g_trackCount);
+   ArrayResize(g_lastBarTimes, g_trackCount);
+   g_lastBarKeys[g_trackCount - 1] = key;
+   g_lastBarTimes[g_trackCount - 1] = 0;
+   return g_trackCount - 1;
+}
+
 int OnInit()
 {
-   // Open/create SQLite database in MQL5/Files/ (MQL5 sandbox)
    string dbPath = "typhoon_mt5_cache.db";
    g_db = DatabaseOpen(dbPath, DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
    if(g_db == INVALID_HANDLE)
    {
-      PrintFormat("BarCacheWriter: failed to open database: %s (error %d)", dbPath, GetLastError());
+      PrintFormat("BarCacheWriter: failed to open database (error %d)", GetLastError());
       return INIT_FAILED;
    }
 
-   // Create table matching TyphooN-Terminal's bar_cache schema
-   // key = "mt5:SYMBOL:TIMEFRAME"
-   // data = raw bar data as TEXT (JSON array — no binary packing, simpler from MQL5)
-   // timestamp = unix epoch seconds
-   // bar_count = number of bars
    if(!DatabaseExecute(g_db,
       "CREATE TABLE IF NOT EXISTS bar_cache ("
       "  key TEXT PRIMARY KEY,"
@@ -91,60 +105,38 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // Enable WAL mode for concurrent read/write (TyphooN-Terminal reads while we write)
    DatabaseExecute(g_db, "PRAGMA journal_mode=WAL");
    DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
 
-   PrintFormat("BarCacheWriter v1.000: SQLite opened at MQL5/Files/%s (WAL mode)", dbPath);
-   PrintFormat("BarCacheWriter: %s symbols, updating every %ds",
+   PrintFormat("BarCacheWriter v1.100: SQLite opened, %s symbols, update every %ds",
       MarketWatchOnly ? "Market Watch" : "ALL", UpdateIntervalSec);
 
    EventSetTimer(UpdateIntervalSec);
 
-   // Initial export
-   ExportAll();
+   // First run: full export (all bars)
+   ExportAll(true);
    return INIT_SUCCEEDED;
 }
 
 void OnTimer()
 {
-   ExportAll();
+   // Subsequent runs: incremental (only recent bars for changed symbols)
+   ExportAll(false);
 }
 
-void ExportAll()
+void ExportAll(bool fullExport)
 {
    if(g_db == INVALID_HANDLE) return;
 
    int symCount = SymbolsTotal(MarketWatchOnly);
    int exported = 0;
+   int skipped = 0;
    int totalBars = 0;
 
-   // Begin transaction for bulk insert (much faster than individual inserts)
    DatabaseExecute(g_db, "BEGIN TRANSACTION");
 
-   // Write symbol list to a special key so TyphooN-Terminal can discover all symbols
-   string symListJson = "[";
-   for(int si = 0; si < symCount; si++)
-   {
-      string s = SymbolName(si, MarketWatchOnly);
-      if(StringLen(s) == 0) continue;
-      if(si > 0) symListJson += ",";
-      symListJson += "\"" + s + "\"";
-   }
-   symListJson += "]";
-   {
-      int req = DatabasePrepare(g_db,
-         "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-      if(req != INVALID_HANDLE)
-      {
-         DatabaseBind(req, 0, "mt5:__SYMBOLS__");
-         DatabaseBind(req, 1, symListJson);
-         DatabaseBind(req, 2, (long)TimeCurrent());
-         DatabaseBind(req, 3, (long)symCount);
-         DatabaseRead(req);
-         DatabaseFinalize(req);
-      }
-   }
+   // Write symbol list
+   WriteSymbolList(symCount);
 
    for(int i = 0; i < symCount; i++)
    {
@@ -153,48 +145,84 @@ void ExportAll()
 
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
-         int bars = ExportSymbolTF(symbol, g_timeframes[tf]);
+         string trackKey = symbol + ":" + TFToStr(g_timeframes[tf]);
+         int trackIdx = GetTrackIndex(trackKey);
+
+         // Check if this symbol:TF has new bars since last export
+         MqlRates lastRate[];
+         if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+         {
+            if(!fullExport && lastRate[0].time == g_lastBarTimes[trackIdx])
+            {
+               skipped++;
+               continue; // no new bar — skip
+            }
+         }
+
+         int barsToFetch = fullExport ? (FullExportBars > 0 ? FullExportBars : 0) : BarsPerTF;
+         int bars = ExportSymbolTF(symbol, g_timeframes[tf], barsToFetch);
          if(bars > 0)
          {
             exported++;
             totalBars += bars;
+            // Update tracking
+            if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+               g_lastBarTimes[trackIdx] = lastRate[0].time;
          }
       }
    }
 
    DatabaseExecute(g_db, "COMMIT");
 
-   // Log on first run + periodically
+   // Always log on full export, periodically on incremental
    static datetime lastLog = 0;
-   static bool firstRun = true;
-   if(firstRun || TimeCurrent() - lastLog > 300)
+   if(fullExport || TimeCurrent() - lastLog > 300)
    {
-      PrintFormat("BarCacheWriter: %d symbols × %d TFs = %d entries, %d total bars",
-         symCount, ArraySize(g_timeframes), exported, totalBars);
-      if(exported == 0 && firstRun)
-         PrintFormat("BarCacheWriter: WARNING — 0 entries exported! Check Experts tab for errors.");
+      PrintFormat("BarCacheWriter: %s — %d exported, %d skipped (unchanged), %d bars",
+         fullExport ? "FULL EXPORT" : "incremental",
+         exported, skipped, totalBars);
       lastLog = TimeCurrent();
-      firstRun = false;
    }
 }
 
-int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
+void WriteSymbolList(int symCount)
+{
+   string json = "[";
+   for(int i = 0; i < symCount; i++)
+   {
+      string s = SymbolName(i, MarketWatchOnly);
+      if(StringLen(s) == 0) continue;
+      if(i > 0) json += ",";
+      json += "\"" + s + "\"";
+   }
+   json += "]";
+
+   int req = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   if(req != INVALID_HANDLE)
+   {
+      DatabaseBind(req, 0, "mt5:__SYMBOLS__");
+      DatabaseBind(req, 1, json);
+      DatabaseBind(req, 2, (long)TimeCurrent());
+      DatabaseBind(req, 3, (long)symCount);
+      DatabaseRead(req);
+      DatabaseFinalize(req);
+   }
+}
+
+int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
 {
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
 
    int copied;
-   if(MaxBars && MaxBarsOverride <= 0)
+   if(maxBars <= 0)
       copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
    else
-   {
-      int limit = (MaxBarsOverride > 0) ? MaxBarsOverride : 10000;
-      copied = CopyRates(symbol, tf, 0, limit, rates);
-   }
+      copied = CopyRates(symbol, tf, 0, maxBars, rates);
    if(copied <= 0) return 0;
 
-   // Build JSON array of bars in chunks to avoid MQL5 string size limits.
-   // MQL5 strings can handle ~16MB but StringFormat has a smaller buffer.
+   // Build JSON — concatenate strings (no StringFormat for large data)
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    string json = "[";
 
@@ -205,7 +233,6 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
       MqlDateTime mdt;
       TimeToStruct(rates[i].time, mdt);
 
-      // Build each bar manually (avoid StringFormat buffer limits)
       json += "{\"timestamp\":\"";
       json += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ", mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
       json += "\",\"open\":";
@@ -222,7 +249,6 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
    }
    json += "]";
 
-   // Upsert via prepared statement (always — avoids SQL injection from JSON content)
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
    long timestamp = (long)TimeCurrent();
 
@@ -230,21 +256,19 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
       "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
    if(req == INVALID_HANDLE)
    {
-      PrintFormat("BarCacheWriter: prepare failed for %s (error %d, json len=%d)",
-         key, GetLastError(), StringLen(json));
+      PrintFormat("BarCacheWriter: prepare failed for %s (error %d)", key, GetLastError());
       return 0;
    }
 
    if(!DatabaseBind(req, 0, key))
-      { PrintFormat("BarCacheWriter: bind 0 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+      { PrintFormat("  bind 0 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
    if(!DatabaseBind(req, 1, json))
-      { PrintFormat("BarCacheWriter: bind 1 failed: %d (json len=%d)", GetLastError(), StringLen(json)); DatabaseFinalize(req); return 0; }
+      { PrintFormat("  bind 1 failed: %d (len=%d)", GetLastError(), StringLen(json)); DatabaseFinalize(req); return 0; }
    if(!DatabaseBind(req, 2, timestamp))
-      { PrintFormat("BarCacheWriter: bind 2 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+      { PrintFormat("  bind 2 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
    if(!DatabaseBind(req, 3, (long)copied))
-      { PrintFormat("BarCacheWriter: bind 3 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
+      { PrintFormat("  bind 3 failed: %d", GetLastError()); DatabaseFinalize(req); return 0; }
 
-   // Execute the INSERT (DatabaseRead returns false for non-SELECT, which is expected)
    DatabaseRead(req);
    DatabaseFinalize(req);
 
