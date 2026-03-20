@@ -30,14 +30,15 @@
 #property strict
 
 input int    UpdateIntervalSec = 10;     // Update interval (seconds)
-input int    MaxBarsPerTF      = 10000;  // Max bars per timeframe
+input bool   MaxBars           = true;   // true = export ALL available bars (max history)
+input int    MaxBarsOverride   = 0;      // >0 overrides MaxBars with fixed limit per TF
 input bool   MarketWatchOnly   = true;   // true = Market Watch symbols only
 input string CustomExportPath  = "";     // Empty = auto (MQL5/Files/typhoon-bars/)
 
-// All timeframes to export — matches TyphooN-Terminal's native timeframes
+// All timeframes — ordered MN1→M1 so higher TFs export first (immediately useful)
 ENUM_TIMEFRAMES g_timeframes[] = {
-   PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_M30,
-   PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1, PERIOD_MN1
+   PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
+   PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
 
 // Map MT5 timeframe enum to TyphooN-Terminal timeframe string
@@ -121,7 +122,17 @@ bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
 
-   int copied = CopyRates(symbol, tf, 0, MaxBarsPerTF, rates);
+   int copied;
+   if(MaxBars && MaxBarsOverride <= 0)
+   {
+      // Max history: request from 1970 to now (server returns all available)
+      copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
+   }
+   else
+   {
+      int limit = (MaxBarsOverride > 0) ? MaxBarsOverride : 10000;
+      copied = CopyRates(symbol, tf, 0, limit, rates);
+   }
    if(copied <= 0) return false;
 
    // Filename: typhoon-bars/EURUSD_1Hour.csv

@@ -32,9 +32,10 @@
 input bool   MarketWatchOnly = true;  // true = Market Watch symbols only
 input string CustomExportPath = "";   // Empty = auto (MQL5/Files/typhoon-bars/)
 
+// Ordered MN1→M1: higher TFs export first (immediately useful for analysis)
 ENUM_TIMEFRAMES g_timeframes[] = {
-   PERIOD_M1, PERIOD_M5, PERIOD_M15, PERIOD_M30,
-   PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1, PERIOD_MN1
+   PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
+   PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
 
 string TFToTerminalString(ENUM_TIMEFRAMES tf)
