@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.411"
+#property version   "1.412"
 #property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property description "v1.412: eliminate redundant CopyRates/SymbolSelect, cache TF strings, schema TEXT→BLOB."
 #property description "v1.411: metadata writes every 5min (was every tick) — enables Rust mtime fast-path."
 #property description "v1.410: tiered bar limits per TF + configurable MaxPendingPerTick (OOM guard)."
 #property description "v1.400: binary TTBR format (48 bytes/bar, zero string overhead)."
@@ -107,6 +108,8 @@ ENUM_TIMEFRAMES g_timeframes[] = {
    PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
    PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
+// Pre-cached TF strings — avoids 7,659 switch evaluations per tick
+string g_tfStrings[9];
 
 // Max bars for initial full export per timeframe — prevents OOM on lower TFs
 // M1: 10K bars = 480KB, M5: 20K = 960KB, vs old 100K = 4.8MB per entry
@@ -311,12 +314,13 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // CSV data table: stores bars as compact CSV text (no JSON overhead)
-   // Format: "timestamp,open,high,low,close,volume\n" per bar
+   // Bar data table: stores bars as TTBR binary blobs (48 bytes/bar, zero string overhead)
+   // __SYMBOLS__ and __SPECS__ keys store TEXT; bar keys store binary BLOB
+   // SQLite dynamic typing handles both — BLOB declaration is self-documenting
    if(!DatabaseExecute(g_db,
       "CREATE TABLE IF NOT EXISTS bar_cache ("
       "  key TEXT PRIMARY KEY,"
-      "  data TEXT NOT NULL,"
+      "  data BLOB NOT NULL,"
       "  timestamp INTEGER NOT NULL,"
       "  bar_count INTEGER NOT NULL DEFAULT 0"
       ")"))
@@ -346,6 +350,10 @@ int OnInit()
    DatabaseExecute(g_db, "PRAGMA cache_size=-8000"); // 8MB page cache
    DatabaseExecute(g_db, "PRAGMA busy_timeout=5000"); // Wait up to 5s for lock instead of failing
 
+   // Cache TF strings once — eliminates switch evaluation per symbol×TF per tick
+   for(int t = 0; t < ArraySize(g_timeframes); t++)
+      g_tfStrings[t] = TFToStr(g_timeframes[t]);
+
    // Detect which sector this instance primarily serves
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
@@ -356,16 +364,16 @@ int OnInit()
    // Restore tracking state from DB — survive restarts without re-exporting everything
    LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.411: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
+   PrintFormat("BarCacheWriter v1.412: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate, MaxPendingPerTick, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
 }
 
-void OnTimer() { ExportAll(false); }
+void OnTimer() { ExportAll(); }
 
-void ExportAll(bool /*fullExport*/)
+void ExportAll()
 {
    if(g_db == INVALID_HANDLE) return;
 
@@ -409,22 +417,26 @@ void ExportAll(bool /*fullExport*/)
          continue;
       }
 
+      // Select once per symbol — covers all TFs (was duplicated inside ExportSymbolTF)
+      SymbolSelect(symbol, true);
+
       // Per-symbol transaction — keeps lock hold time short so readers aren't blocked
       SafeBegin();
 
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
-         string trackKey = symbol + ":" + TFToStr(g_timeframes[tf]);
+         string trackKey = symbol + ":" + g_tfStrings[tf];
          int idx = GetTrackIndex(trackKey);
+
+         // Single CopyRates call per symbol/TF — reuse for both change detection and tracking
+         MqlRates lastRate[];
+         int gotLast = CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate);
 
          // Never synced — try to export whatever is locally available (non-blocking)
          if(g_trackTimes[idx] == 0)
          {
             if(pendingRetries >= MaxPendingPerTick) continue; // defer to next tick
             pendingRetries++;
-
-            // Add to Market Watch (triggers background history download)
-            SymbolSelect(symbol, true);
 
             // Non-blocking: use (start_pos, count) form which returns locally available data
             // immediately without waiting for server download.
@@ -435,8 +447,7 @@ void ExportAll(bool /*fullExport*/)
             {
                exported++;
                totalBars += bars;
-               MqlRates lastRate[];
-               if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+               if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
                   SaveTrackTime(trackKey, lastRate[0].time);
@@ -446,14 +457,10 @@ void ExportAll(bool /*fullExport*/)
          }
 
          // Already synced — skip if last bar hasn't changed
-         MqlRates lastRate[];
-         if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+         if(gotLast == 1 && lastRate[0].time == g_trackTimes[idx])
          {
-            if(lastRate[0].time == g_trackTimes[idx])
-            {
-               skipped++;
-               continue;
-            }
+            skipped++;
+            continue;
          }
 
          // Incremental: export recent bars only
@@ -462,7 +469,7 @@ void ExportAll(bool /*fullExport*/)
          {
             exported++;
             totalBars += bars;
-            if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+            if(gotLast == 1)
             {
                g_trackTimes[idx] = lastRate[0].time;
                SaveTrackTime(trackKey, lastRate[0].time);
@@ -626,8 +633,7 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
 
-   // Ensure symbol is selected in Market Watch (required for CopyRates to work)
-   SymbolSelect(symbol, true);
+   // SymbolSelect already called once per symbol in ExportAll() — no need to repeat here
 
    int copied;
    if(maxBars <= 0)
