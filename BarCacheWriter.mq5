@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.307"
+#property version   "1.308"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -32,7 +32,6 @@
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input int    BarsPerUpdate     = 100;    // Bars per incremental update (recent only)
-input int    FullExportBars    = 0;      // Full export bar count (0 = max, only on first run)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 
 int g_db = INVALID_HANDLE;
@@ -42,41 +41,6 @@ string g_trackKeys[];
 datetime g_trackTimes[];
 int g_trackCount = 0;
 
-bool g_fullExportDone = false;
-
-// Cached set of keys already in DB (for skip-on-restart optimization)
-string g_existingKeys[];
-int g_existingKeyCount = 0;
-
-// Check if a key already exists in the DB (populated on startup)
-bool KeyExistsInDB(string key)
-{
-   for(int i = 0; i < g_existingKeyCount; i++)
-      if(g_existingKeys[i] == key) return true;
-   return false;
-}
-
-// Load existing bar keys from DB on startup
-void LoadExistingKeys()
-{
-   if(g_db == INVALID_HANDLE) return;
-   int req = DatabasePrepare(g_db,
-      "SELECT key FROM bar_cache WHERE key NOT LIKE '%__SYMBOLS__%' AND key NOT LIKE '%__SPECS__%' AND key NOT LIKE '%:chunks' AND key NOT LIKE '%:chunk_%'");
-   if(req == INVALID_HANDLE) return;
-
-   g_existingKeyCount = 0;
-   while(DatabaseRead(req))
-   {
-      string key = "";
-      DatabaseColumnText(req, 0, key);
-      g_existingKeyCount++;
-      ArrayResize(g_existingKeys, g_existingKeyCount);
-      g_existingKeys[g_existingKeyCount - 1] = key;
-   }
-   DatabaseFinalize(req);
-   if(g_existingKeyCount > 0)
-      PrintFormat("BarCacheWriter: %d existing keys in DB (will skip on full export)", g_existingKeyCount);
-}
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
 bool SafeBegin()
@@ -196,14 +160,11 @@ int OnInit()
    DatabaseExecute(g_db, "PRAGMA cache_size=-8000"); // 8MB page cache
    DatabaseExecute(g_db, "PRAGMA busy_timeout=5000"); // Wait up to 5s for lock instead of failing
 
-   // Load existing keys to skip redundant full exports on restart
-   LoadExistingKeys();
-
    // Detect which sector this instance primarily serves
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.307: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.308: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -226,7 +187,7 @@ void ExportAll(bool fullExport)
    WriteSymbolSpecs(symCount);
    SafeCommit();
 
-   int skippedNative = 0, skippedExisting = 0;
+   int skippedNative = 0;
 
    for(int i = 0; i < symCount; i++)
    {
@@ -254,20 +215,6 @@ void ExportAll(bool fullExport)
             if(!fullExport && lastRate[0].time == g_trackTimes[idx])
             {
                skipped++;
-               continue;
-            }
-         }
-
-         // Opt 2: On full export, skip keys that already exist in DB (restart optimization)
-         if(fullExport)
-         {
-            string baseKey = "mt5:" + symbol + ":" + TFToStr(g_timeframes[tf]);
-            if(KeyExistsInDB(baseKey))
-            {
-               skippedExisting++;
-               // Still update trackTime so incrementals work correctly
-               if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
-                  g_trackTimes[idx] = lastRate[0].time;
                continue;
             }
          }
@@ -306,8 +253,8 @@ void ExportAll(bool fullExport)
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
       if(fullExport)
-         PrintFormat("BarCacheWriter: FULL — %d exported, %d skipped(existing), %d skipped(shared), %d bars, %d symbols",
-            exported, skippedExisting, skippedNative, totalBars, symCount);
+         PrintFormat("BarCacheWriter: FULL — %d exported, %d skipped(shared), %d bars, %d symbols",
+            exported, skippedNative, totalBars, symCount);
       else
          PrintFormat("BarCacheWriter: incremental — %d exported, %d skipped(unchanged), %d bars, %d symbols",
             exported, skipped, totalBars, symCount);
