@@ -25,12 +25,8 @@
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.413"
 #property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
-#property description "v1.413: give up after 10 consecutive failures per symbol/TF (stop retrying forever)."
-#property description "v1.412: eliminate redundant CopyRates/SymbolSelect, cache TF strings, schema TEXT→BLOB."
-#property description "v1.411: metadata writes every 5min (was every tick) — enables Rust mtime fast-path."
-#property description "v1.410: tiered bar limits per TF + configurable MaxPendingPerTick (OOM guard)."
-#property description "v1.400: binary TTBR format (48 bytes/bar, zero string overhead)."
-#property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
+#property description "v1.413: Bars() pre-check + give up after 10 failures per symbol/TF."
+#property description "v1.412: cache TF strings, eliminate redundant CopyRates/SymbolSelect."
 #property strict
 
 
