@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.314"
+#property version   "1.315"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -37,26 +37,29 @@ input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 int g_db = INVALID_HANDLE;
 
 // Track last bar time per symbol:TF to skip unchanged data
+// Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
+// With 851 symbols × 9 TFs = 7,659 keys, this matters every tick
 string g_trackKeys[];
 datetime g_trackTimes[];
 int g_trackCount = 0;
+bool g_trackSorted = true; // false when new keys appended, triggers re-sort
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
 bool SafeBegin()
 {
-   if(!SafeBegin())
+   if(!DatabaseTransactionBegin(g_db))
    {
       // Likely already in a transaction from a prior failed commit — rollback and retry
       DatabaseExecute(g_db, "ROLLBACK");
-      return SafeBegin();
+      return DatabaseTransactionBegin(g_db);
    }
    return true;
 }
 
 bool SafeCommit()
 {
-   if(!SafeCommit())
+   if(!DatabaseTransactionCommit(g_db))
    {
       // Commit failed (lock timeout) — rollback to clear transaction state
       DatabaseExecute(g_db, "ROLLBACK");
@@ -118,15 +121,64 @@ string TFToStr(ENUM_TIMEFRAMES tf)
    return "?";
 }
 
+// Binary search for key in sorted g_trackKeys. Returns index or -1.
+int BinarySearchKey(const string &keys[], int count, string key)
+{
+   int lo = 0, hi = count - 1;
+   while(lo <= hi)
+   {
+      int mid = (lo + hi) / 2;
+      int cmp = StringCompare(keys[mid], key);
+      if(cmp == 0) return mid;
+      if(cmp < 0) lo = mid + 1;
+      else hi = mid - 1;
+   }
+   return -1;
+}
+
+// Sort tracking arrays by key (insertion sort — only runs when new keys added)
+void SortTrackArrays()
+{
+   // Simple insertion sort — runs once after initial population, then never again
+   for(int i = 1; i < g_trackCount; i++)
+   {
+      string tmpKey = g_trackKeys[i];
+      datetime tmpTime = g_trackTimes[i];
+      int j = i - 1;
+      while(j >= 0 && StringCompare(g_trackKeys[j], tmpKey) > 0)
+      {
+         g_trackKeys[j + 1] = g_trackKeys[j];
+         g_trackTimes[j + 1] = g_trackTimes[j];
+         j--;
+      }
+      g_trackKeys[j + 1] = tmpKey;
+      g_trackTimes[j + 1] = tmpTime;
+   }
+   g_trackSorted = true;
+}
+
 int GetTrackIndex(string key)
 {
-   for(int i = 0; i < g_trackCount; i++)
-      if(g_trackKeys[i] == key) return i;
+   // Binary search if sorted
+   if(g_trackSorted && g_trackCount > 0)
+   {
+      int idx = BinarySearchKey(g_trackKeys, g_trackCount, key);
+      if(idx >= 0) return idx;
+   }
+   else if(!g_trackSorted)
+   {
+      // Linear fallback during population phase (before first sort)
+      for(int i = 0; i < g_trackCount; i++)
+         if(g_trackKeys[i] == key) return i;
+   }
+
+   // Not found — append and mark unsorted
    g_trackCount++;
-   ArrayResize(g_trackKeys, g_trackCount);
-   ArrayResize(g_trackTimes, g_trackCount);
+   ArrayResize(g_trackKeys, g_trackCount, 1024); // reserve 1024 extra to reduce reallocs
+   ArrayResize(g_trackTimes, g_trackCount, 1024);
    g_trackKeys[g_trackCount - 1] = key;
    g_trackTimes[g_trackCount - 1] = 0;
+   g_trackSorted = false;
    return g_trackCount - 1;
 }
 
@@ -164,7 +216,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.314: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.315: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -263,6 +315,10 @@ void ExportAll(bool /*fullExport*/)
    }
 
    SafeCommit();
+
+   // Sort tracking arrays after population phase for O(log n) lookups on subsequent ticks
+   if(!g_trackSorted && g_trackCount > 0)
+      SortTrackArrays();
 
    // Count TF slots still pending (never successfully exported)
    int pendingSlots = 0;
@@ -425,8 +481,8 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
    string baseKey = "mt5:" + symbol + ":" + TFToStr(tf);
    int totalChunks = (int)MathCeil((double)copied / CHUNK_SIZE);
 
-   // Single transaction for all chunks of this symbol/TF — reduces lock contention
-   SafeBegin();
+   // No transaction here — caller (ExportAll) wraps everything in a single transaction.
+   // SQLite doesn't support nested transactions.
 
    for(int chunk = 0; chunk < totalChunks; chunk++)
    {
@@ -487,8 +543,6 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
       }
    }
 
-   SafeCommit();
-
    static int chunkLog = 0;
    if(chunkLog < 10)
    {
@@ -541,19 +595,13 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
       MqlDateTime mdt;
       TimeToStruct(rates[i].time, mdt);
 
-      csv += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ",
-         mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
-      csv += ",";
-      csv += DoubleToString(rates[i].open, digits);
-      csv += ",";
-      csv += DoubleToString(rates[i].high, digits);
-      csv += ",";
-      csv += DoubleToString(rates[i].low, digits);
-      csv += ",";
-      csv += DoubleToString(rates[i].close, digits);
-      csv += ",";
-      csv += IntegerToString(rates[i].tick_volume);
-      csv += "\n";
+      csv += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ,%s,%s,%s,%s,%s\n",
+         mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec,
+         DoubleToString(rates[i].open, digits),
+         DoubleToString(rates[i].high, digits),
+         DoubleToString(rates[i].low, digits),
+         DoubleToString(rates[i].close, digits),
+         IntegerToString(rates[i].tick_volume));
    }
 
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
