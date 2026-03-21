@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.311"
+#property version   "1.312"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -164,32 +164,33 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.311: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.312: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
-   ExportAll(true); // initial full export (skips keys already in DB)
+   // No blocking full export on init — the timer handles everything incrementally,
+   // retrying pending symbols each tick (avoids hanging on 800+ CopyRates calls)
    return INIT_SUCCEEDED;
 }
 
 void OnTimer() { ExportAll(false); }
 
-void ExportAll(bool fullExport)
+void ExportAll(bool /*fullExport*/)
 {
    if(g_db == INVALID_HANDLE) return;
 
    int symCount = SymbolsTotal(MarketWatchOnly);
    int exported = 0, skipped = 0, totalBars = 0;
    int skippedNative = 0;
+   int pendingRetries = 0;        // count of pending full exports attempted this tick
+   int maxPendingPerTick = 5;     // limit pending retries to avoid blocking too long
 
-   // For incremental updates, batch ALL writes into a single transaction
-   if(!fullExport) SafeBegin();
+   // Batch all incremental writes into a single transaction
+   SafeBegin();
 
    // Write metadata
-   if(fullExport) SafeBegin();
    WriteSymbolList(symCount);
    WriteSymbolSpecs(symCount);
-   if(fullExport) SafeCommit();
 
    for(int i = 0; i < symCount; i++)
    {
@@ -203,58 +204,65 @@ void ExportAll(bool fullExport)
          continue;
       }
 
-      int symExported = 0;
-
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
          string trackKey = symbol + ":" + TFToStr(g_timeframes[tf]);
          int idx = GetTrackIndex(trackKey);
 
-         // Skip if last bar hasn't changed (incremental mode)
+         // Never synced — retry full export (limited per tick to avoid blocking)
+         if(g_trackTimes[idx] == 0)
+         {
+            if(pendingRetries >= maxPendingPerTick) continue; // defer to next tick
+            pendingRetries++;
+
+            // Ensure symbol history is requested from server
+            SymbolSelect(symbol, true);
+
+            // Break out of batch transaction for chunked write (has its own transaction)
+            SafeCommit();
+            int bars = ExportSymbolTFChunked(symbol, g_timeframes[tf]);
+            SafeBegin();
+
+            if(bars > 0)
+            {
+               exported++;
+               totalBars += bars;
+               MqlRates lastRate[];
+               if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+                  g_trackTimes[idx] = lastRate[0].time;
+            }
+            continue;
+         }
+
+         // Already synced — skip if last bar hasn't changed
          MqlRates lastRate[];
          if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
          {
-            if(!fullExport && lastRate[0].time == g_trackTimes[idx])
+            if(lastRate[0].time == g_trackTimes[idx])
             {
                skipped++;
                continue;
             }
          }
 
-         // Fetch bars: full export for init OR symbols never synced, incremental for the rest
-         int bars;
-         bool needsFull = fullExport || (g_trackTimes[idx] == 0);
-         if(needsFull)
-         {
-            // Break out of the batched incremental transaction for a full chunked write
-            if(!fullExport) SafeCommit();
-            bars = ExportSymbolTFChunked(symbol, g_timeframes[tf]);
-            if(!fullExport) SafeBegin();
-         }
-         else
-            bars = ExportSymbolTF(symbol, g_timeframes[tf], BarsPerUpdate);
-
+         // Incremental: export recent bars only
+         int bars = ExportSymbolTF(symbol, g_timeframes[tf], BarsPerUpdate);
          if(bars > 0)
          {
-            symExported++;
             exported++;
             totalBars += bars;
             if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
                g_trackTimes[idx] = lastRate[0].time;
          }
       }
-
-      if(fullExport && symExported > 0)
-         PrintFormat("BarCacheWriter: %s — %d TFs exported", symbol, symExported);
    }
 
-   // Commit the single incremental transaction
-   if(!fullExport) SafeCommit();
+   SafeCommit();
 
-   // Count symbols still pending (never successfully exported any TF)
-   int pendingSymbols = 0;
+   // Count TF slots still pending (never successfully exported)
+   int pendingSlots = 0;
    for(int i = 0; i < g_trackCount; i++)
-      if(g_trackTimes[i] == 0) pendingSymbols++;
+      if(g_trackTimes[i] == 0) pendingSlots++;
 
    static datetime lastLog = 0;
    static bool first = true;
@@ -264,12 +272,8 @@ void ExportAll(bool fullExport)
 
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
-      if(fullExport)
-         PrintFormat("BarCacheWriter: FULL — %d exported, %d skipped(shared), %d bars, %d symbols, %d pending",
-            exported, skippedNative, totalBars, symCount, pendingSymbols);
-      else
-         PrintFormat("BarCacheWriter: incremental — %d exported, %d skipped(unchanged), %d bars, %d symbols, %d pending",
-            exported, skipped, totalBars, symCount, pendingSymbols);
+      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending slots (%d retried this tick)",
+         exported, skipped, totalBars, pendingSlots, pendingRetries);
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
