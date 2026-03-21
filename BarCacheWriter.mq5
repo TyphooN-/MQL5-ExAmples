@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.313"
+#property version   "1.314"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -164,7 +164,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.313: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.314: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -179,7 +179,10 @@ void ExportAll(bool /*fullExport*/)
 {
    if(g_db == INVALID_HANDLE) return;
 
+   uint tickStart = GetTickCount();
    int symCount = SymbolsTotal(MarketWatchOnly);
+   PrintFormat("BarCacheWriter: tick start — %d symbols", symCount);
+
    int exported = 0, skipped = 0, totalBars = 0;
    int skippedNative = 0;
    int pendingRetries = 0;        // count of pending full exports attempted this tick
@@ -191,6 +194,9 @@ void ExportAll(bool /*fullExport*/)
    // Write metadata
    WriteSymbolList(symCount);
    WriteSymbolSpecs(symCount);
+   uint afterMeta = GetTickCount();
+   if(afterMeta - tickStart > 1000)
+      PrintFormat("  metadata took %d ms", afterMeta - tickStart);
 
    for(int i = 0; i < symCount; i++)
    {
@@ -271,8 +277,9 @@ void ExportAll(bool /*fullExport*/)
 
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
-      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending slots (%d retried this tick)",
-         exported, skipped, totalBars, pendingSlots, pendingRetries);
+      uint elapsed = GetTickCount() - tickStart;
+      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending (%d retried) | %dms",
+         exported, skipped, totalBars, pendingSlots, pendingRetries, elapsed);
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
