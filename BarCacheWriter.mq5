@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.305"
+#property version   "1.306"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -101,55 +101,41 @@ bool SafeCommit()
    return true;
 }
 
-// Identify symbols that are "native" to this instance (not shared forex pairs)
-// Shared symbols are those that appear on ALL Darwinex accounts (EURGBP, EURUSD, GBPUSD, etc.)
-// We detect this by sector: if this instance's primary sector isn't Currency, skip Currency symbols
-string g_primarySector;
+// Detect whether this is a specialized account (crypto/futures) that should skip forex pairs.
+// Forex pairs appear on ALL Darwinex accounts — the main CFD account exports them,
+// so crypto and futures accounts should skip them to avoid redundant writes.
+bool g_skipForex = false;
 
-void DetectPrimarySector(int symCount)
+void DetectAccountType(int symCount)
 {
-   // Count symbols per sector to determine this instance's primary purpose
-   int forexCount = 0, cryptoCount = 0, futuresCount = 0, stockCount = 0, otherCount = 0;
+   int forexCount = 0, cryptoCount = 0, futuresCount = 0, stockCount = 0;
    for(int i = 0; i < symCount; i++)
    {
       string sym = SymbolName(i, MarketWatchOnly);
       string sector = "";
-      if(SymbolInfoString(sym, SYMBOL_SECTOR_NAME, sector))
-      {
-         if(sector == "Currency") forexCount++;
-         else if(sector == "Crypto" || sector == "Cryptocurrency") cryptoCount++;
-         else if(sector == "Indexes" || sector == "Commodity" || sector == "Energy") futuresCount++;
-         else stockCount++;
-      }
-      else otherCount++;
+      if(!SymbolInfoString(sym, SYMBOL_SECTOR_NAME, sector)) continue;
+      if(sector == "Currency") forexCount++;
+      else if(sector == "Crypto" || sector == "Cryptocurrency") cryptoCount++;
+      else if(sector == "Indexes" || sector == "Commodity" || sector == "Energy") futuresCount++;
+      else stockCount++;
    }
 
-   // The instance with the MOST forex symbols is the forex primary
-   // Crypto/Futures instances have fewer forex pairs (just the shared ones)
-   int nonForex = cryptoCount + futuresCount + stockCount + otherCount;
-   if(forexCount > nonForex)
-      g_primarySector = "Currency"; // This is the forex/main instance
-   else if(cryptoCount >= futuresCount && cryptoCount >= stockCount)
-      g_primarySector = "Crypto";
-   else if(futuresCount >= stockCount)
-      g_primarySector = "Futures";
-   else
-      g_primarySector = "Stocks";
+   // If this account has ANY crypto or futures symbols, it's a specialized account —
+   // the main CFD account (forex + commodities + stocks) handles forex export.
+   g_skipForex = (cryptoCount > 0 || futuresCount > 0);
 
-   PrintFormat("BarCacheWriter: primary sector=%s (forex=%d, crypto=%d, futures=%d, stocks=%d)",
-      g_primarySector, forexCount, cryptoCount, futuresCount, stockCount);
+   PrintFormat("BarCacheWriter: %s forex (forex=%d, crypto=%d, futures=%d, stocks=%d)",
+      g_skipForex ? "SKIPPING" : "EXPORTING", forexCount, cryptoCount, futuresCount, stockCount);
 }
 
 bool IsNativeSymbol(string symbol)
 {
-   // If this is the main/forex instance, export everything
-   if(g_primarySector == "Currency" || g_primarySector == "Stocks") return true;
+   if(!g_skipForex) return true;
 
-   // For non-forex instances, skip shared forex pairs (they'll be exported by the main instance)
    string sector = "";
    if(SymbolInfoString(symbol, SYMBOL_SECTOR_NAME, sector))
    {
-      if(sector == "Currency") return false; // Skip forex on non-forex instances
+      if(sector == "Currency") return false;
    }
    return true;
 }
@@ -224,9 +210,9 @@ int OnInit()
 
    // Detect which sector this instance primarily serves
    int initSymCount = SymbolsTotal(MarketWatchOnly);
-   DetectPrimarySector(initSymCount);
+   DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.305: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.306: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
