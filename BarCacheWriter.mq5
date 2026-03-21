@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.312"
+#property version   "1.313"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -164,7 +164,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.312: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.313: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -183,7 +183,7 @@ void ExportAll(bool /*fullExport*/)
    int exported = 0, skipped = 0, totalBars = 0;
    int skippedNative = 0;
    int pendingRetries = 0;        // count of pending full exports attempted this tick
-   int maxPendingPerTick = 5;     // limit pending retries to avoid blocking too long
+   int maxPendingPerTick = 50;    // non-blocking retries, can handle more per tick
 
    // Batch all incremental writes into a single transaction
    SafeBegin();
@@ -209,19 +209,18 @@ void ExportAll(bool /*fullExport*/)
          string trackKey = symbol + ":" + TFToStr(g_timeframes[tf]);
          int idx = GetTrackIndex(trackKey);
 
-         // Never synced — retry full export (limited per tick to avoid blocking)
+         // Never synced — try to export whatever is locally available (non-blocking)
          if(g_trackTimes[idx] == 0)
          {
             if(pendingRetries >= maxPendingPerTick) continue; // defer to next tick
             pendingRetries++;
 
-            // Ensure symbol history is requested from server
+            // Add to Market Watch (triggers background history download)
             SymbolSelect(symbol, true);
 
-            // Break out of batch transaction for chunked write (has its own transaction)
-            SafeCommit();
-            int bars = ExportSymbolTFChunked(symbol, g_timeframes[tf]);
-            SafeBegin();
+            // Non-blocking: use (start_pos, count) form which returns locally available data
+            // immediately without waiting for server download. 100000 = "give me everything you have"
+            int bars = ExportSymbolTF(symbol, g_timeframes[tf], 100000);
 
             if(bars > 0)
             {
