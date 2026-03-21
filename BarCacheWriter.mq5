@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.412"
+#property version   "1.413"
 #property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property description "v1.413: give up after 10 consecutive failures per symbol/TF (stop retrying forever)."
 #property description "v1.412: eliminate redundant CopyRates/SymbolSelect, cache TF strings, schema TEXT→BLOB."
 #property description "v1.411: metadata writes every 5min (was every tick) — enables Rust mtime fast-path."
 #property description "v1.410: tiered bar limits per TF + configurable MaxPendingPerTick (OOM guard)."
@@ -46,8 +47,11 @@ string g_accountTag = "";
 // With 851 symbols × 9 TFs = 7,659 keys, this matters every tick
 string g_trackKeys[];
 datetime g_trackTimes[];
+int g_trackFails[];  // Consecutive export failures per key — give up after MAX_CONSEC_FAILS
 int g_trackCount = 0;
 bool g_trackSorted = true; // false when new keys appended, triggers re-sort
+#define MAX_CONSEC_FAILS 10  // Give up on a symbol/TF after this many consecutive failures
+#define FAIL_SENTINEL  1     // Sentinel timestamp: marks "permanently failed, stop retrying"
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
@@ -170,15 +174,18 @@ void SortTrackArrays()
    {
       string tmpKey = g_trackKeys[i];
       datetime tmpTime = g_trackTimes[i];
+      int tmpFails = g_trackFails[i];
       int j = i - 1;
       while(j >= 0 && StringCompare(g_trackKeys[j], tmpKey) > 0)
       {
          g_trackKeys[j + 1] = g_trackKeys[j];
          g_trackTimes[j + 1] = g_trackTimes[j];
+         g_trackFails[j + 1] = g_trackFails[j];
          j--;
       }
       g_trackKeys[j + 1] = tmpKey;
       g_trackTimes[j + 1] = tmpTime;
+      g_trackFails[j + 1] = tmpFails;
    }
    g_trackSorted = true;
 }
@@ -254,8 +261,10 @@ int GetTrackIndex(string key)
    g_trackCount++;
    ArrayResize(g_trackKeys, g_trackCount, 1024); // reserve 1024 extra to reduce reallocs
    ArrayResize(g_trackTimes, g_trackCount, 1024);
+   ArrayResize(g_trackFails, g_trackCount, 1024);
    g_trackKeys[g_trackCount - 1] = key;
    g_trackTimes[g_trackCount - 1] = 0;
+   g_trackFails[g_trackCount - 1] = 0;
    g_trackSorted = false;
    return g_trackCount - 1;
 }
@@ -364,7 +373,7 @@ int OnInit()
    // Restore tracking state from DB — survive restarts without re-exporting everything
    LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.412: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
+   PrintFormat("BarCacheWriter v1.413: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate, MaxPendingPerTick, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
@@ -435,6 +444,12 @@ void ExportAll()
          // Never synced — try to export whatever is locally available (non-blocking)
          if(g_trackTimes[idx] == 0)
          {
+            // Give up after MAX_CONSEC_FAILS — broker doesn't have this history
+            if(g_trackFails[idx] >= MAX_CONSEC_FAILS)
+            {
+               skipped++;
+               continue;
+            }
             if(pendingRetries >= MaxPendingPerTick) continue; // defer to next tick
             pendingRetries++;
 
@@ -447,10 +462,22 @@ void ExportAll()
             {
                exported++;
                totalBars += bars;
+               g_trackFails[idx] = 0; // Reset on success
                if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
                   SaveTrackTime(trackKey, lastRate[0].time);
+               }
+            }
+            else
+            {
+               g_trackFails[idx]++;
+               if(g_trackFails[idx] >= MAX_CONSEC_FAILS)
+               {
+                  // Mark as permanently failed — stop retrying
+                  g_trackTimes[idx] = (datetime)FAIL_SENTINEL;
+                  SaveTrackTime(trackKey, (datetime)FAIL_SENTINEL);
+                  PrintFormat("BarCacheWriter: giving up on %s after %d failures", trackKey, MAX_CONSEC_FAILS);
                }
             }
             continue;
@@ -484,10 +511,14 @@ void ExportAll()
    if(!g_trackSorted && g_trackCount > 0)
       SortTrackArrays();
 
-   // Count TF slots still pending (never successfully exported)
+   // Count TF slots still pending (never successfully exported, excluding permanently failed)
    int pendingSlots = 0;
+   int failedSlots = 0;
    for(int i = 0; i < g_trackCount; i++)
+   {
       if(g_trackTimes[i] == 0) pendingSlots++;
+      else if(g_trackTimes[i] == (datetime)FAIL_SENTINEL) failedSlots++;
+   }
 
    static datetime lastLog = 0;
    static bool first = true;
