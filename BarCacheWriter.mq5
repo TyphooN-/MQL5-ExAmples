@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.309"
+#property version   "1.310"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -164,7 +164,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.309: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.310: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -180,21 +180,23 @@ void ExportAll(bool fullExport)
 
    int symCount = SymbolsTotal(MarketWatchOnly);
    int exported = 0, skipped = 0, totalBars = 0;
+   int skippedNative = 0;
 
-   // Write metadata in its own transaction (available immediately)
-   SafeBegin();
+   // For incremental updates, batch ALL writes into a single transaction
+   if(!fullExport) SafeBegin();
+
+   // Write metadata
+   if(fullExport) SafeBegin();
    WriteSymbolList(symCount);
    WriteSymbolSpecs(symCount);
-   SafeCommit();
-
-   int skippedNative = 0;
+   if(fullExport) SafeCommit();
 
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
 
-      // Opt 1: Skip shared forex pairs on non-forex instances
+      // Skip shared forex pairs on non-forex instances
       if(!IsNativeSymbol(symbol))
       {
          skippedNative += ArraySize(g_timeframes);
@@ -224,11 +226,7 @@ void ExportAll(bool fullExport)
          if(fullExport)
             bars = ExportSymbolTFChunked(symbol, g_timeframes[tf]);
          else
-         {
-            SafeBegin();
             bars = ExportSymbolTF(symbol, g_timeframes[tf], BarsPerUpdate);
-            SafeCommit();
-         }
 
          if(bars > 0)
          {
@@ -243,6 +241,9 @@ void ExportAll(bool fullExport)
       if(fullExport && symExported > 0)
          PrintFormat("BarCacheWriter: %s — %d TFs exported", symbol, symExported);
    }
+
+   // Commit the single incremental transaction
+   if(!fullExport) SafeCommit();
 
    static datetime lastLog = 0;
    static bool first = true;
