@@ -23,15 +23,14 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.413"
+#property version   "1.414"
 #property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
 #property description "v1.413: Bars() pre-check + give up after 10 failures per symbol/TF."
-#property description "v1.412: cache TF strings, eliminate redundant CopyRates/SymbolSelect."
 #property strict
 
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
-input int    BarsPerUpdate     = 100;    // Bars per incremental update (recent only)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    MaxPendingPerTick = 10;     // Max full exports per tick (memory guard)
 
@@ -369,8 +368,8 @@ int OnInit()
    // Restore tracking state from DB — survive restarts without re-exporting everything
    LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.413: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
-      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate, MaxPendingPerTick, g_trackCount);
+   PrintFormat("BarCacheWriter v1.414: %s symbols(%d), %ds interval, full history, %d pending/tick, %d cached keys",
+      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, MaxPendingPerTick, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
@@ -498,8 +497,9 @@ void ExportAll()
             continue;
          }
 
-         // Incremental: export recent bars only
-         int bars = ExportSymbolTF(symbol, g_timeframes[tf], BarsPerUpdate);
+         // Incremental: re-export full local history so older bars aren't truncated.
+         // Uses same tiered limits as initial export — all locally cached data.
+         int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]));
          if(bars > 0)
          {
             exported++;
