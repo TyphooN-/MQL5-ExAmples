@@ -23,12 +23,12 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.308"
+#property version   "1.309"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
 
-#define CHUNK_SIZE 5000
+#define CHUNK_SIZE 10000
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input int    BarsPerUpdate     = 100;    // Bars per incremental update (recent only)
@@ -164,7 +164,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.308: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.309: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -403,6 +403,9 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
    string baseKey = "mt5:" + symbol + ":" + TFToStr(tf);
    int totalChunks = (int)MathCeil((double)copied / CHUNK_SIZE);
 
+   // Single transaction for all chunks of this symbol/TF — reduces lock contention
+   SafeBegin();
+
    for(int chunk = 0; chunk < totalChunks; chunk++)
    {
       int startIdx = chunk * CHUNK_SIZE;
@@ -431,7 +434,6 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
       string key = baseKey;
       if(chunk > 0) key += ":chunk_" + IntegerToString(chunk);
 
-      SafeBegin();
       int req = DatabasePrepare(g_db,
          "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
       if(req != INVALID_HANDLE)
@@ -445,14 +447,11 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
          }
          DatabaseFinalize(req);
       }
-      SafeCommit();
    }
 
    // Store total chunk count so reader knows how many to merge
-   // Key: "mt5:SYMBOL:TF:chunks" → value = totalChunks
    if(totalChunks > 1)
    {
-      SafeBegin();
       int req = DatabasePrepare(g_db,
          "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
       if(req != INVALID_HANDLE)
@@ -464,8 +463,9 @@ int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
          DatabaseRead(req);
          DatabaseFinalize(req);
       }
-      SafeCommit();
    }
+
+   SafeCommit();
 
    static int chunkLog = 0;
    if(chunkLog < 10)
