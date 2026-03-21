@@ -23,18 +23,21 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.315"
-#property description "Writes bar data + symbol specs to SQLite using CSV format."
+#property version   "1.410"
+#property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property description "v1.410: tiered bar limits per TF + configurable MaxPendingPerTick (OOM guard)."
+#property description "v1.400: binary TTBR format (48 bytes/bar, zero string overhead)."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
 
-#define CHUNK_SIZE 10000
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input int    BarsPerUpdate     = 100;    // Bars per incremental update (recent only)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
+input int    MaxPendingPerTick = 10;     // Max full exports per tick (memory guard)
 
 int g_db = INVALID_HANDLE;
+string g_accountTag = "";
 
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
@@ -104,6 +107,25 @@ ENUM_TIMEFRAMES g_timeframes[] = {
    PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
 
+// Max bars for initial full export per timeframe — prevents OOM on lower TFs
+// M1: 10K bars = 480KB, M5: 20K = 960KB, vs old 100K = 4.8MB per entry
+int MaxBarsForTF(ENUM_TIMEFRAMES tf)
+{
+   switch(tf)
+   {
+      case PERIOD_MN1: return 1000;
+      case PERIOD_W1:  return 2000;
+      case PERIOD_D1:  return 10000;
+      case PERIOD_H4:  return 20000;
+      case PERIOD_H1:  return 50000;
+      case PERIOD_M30: return 50000;
+      case PERIOD_M15: return 50000;
+      case PERIOD_M5:  return 20000;
+      case PERIOD_M1:  return 10000;
+   }
+   return 10000;
+}
+
 string TFToStr(ENUM_TIMEFRAMES tf)
 {
    switch(tf)
@@ -157,6 +179,58 @@ void SortTrackArrays()
    g_trackSorted = true;
 }
 
+// ── TTBR Binary Bar Format ───────────────────────────────────────────────
+// Identical to TyphooN-Terminal's internal format — zero conversion on read.
+// [4 bytes: "TTBR"] [4 bytes: bar count LE u32] [48 bytes/bar: i64 ts_ms, f64 O,H,L,C,V]
+// 48 bytes/bar vs ~60 chars/bar CSV. No StringFormat, no string concat, no GC pressure.
+union ByteConv { long l; double d; uchar b[8]; };
+
+void WriteRaw8(uchar &buf[], int off, ByteConv &bc)
+{
+   buf[off]   = bc.b[0]; buf[off+1] = bc.b[1]; buf[off+2] = bc.b[2]; buf[off+3] = bc.b[3];
+   buf[off+4] = bc.b[4]; buf[off+5] = bc.b[5]; buf[off+6] = bc.b[6]; buf[off+7] = bc.b[7];
+}
+
+void PackBarsBinary(const MqlRates &rates[], int startIdx, int count, uchar &buffer[])
+{
+   int totalBytes = 8 + count * 48;
+   ArrayResize(buffer, totalBytes);
+
+   // Magic: TTBR
+   buffer[0] = 'T'; buffer[1] = 'T'; buffer[2] = 'B'; buffer[3] = 'R';
+
+   // Count (LE u32)
+   buffer[4] = (uchar)(count & 0xFF);
+   buffer[5] = (uchar)((count >> 8) & 0xFF);
+   buffer[6] = (uchar)((count >> 16) & 0xFF);
+   buffer[7] = (uchar)((count >> 24) & 0xFF);
+
+   ByteConv bc;
+   for(int i = 0; i < count; i++)
+   {
+      int off = 8 + i * 48;
+      int ri = startIdx + i;
+
+      bc.l = (long)rates[ri].time * 1000;  // timestamp as epoch milliseconds
+      WriteRaw8(buffer, off, bc);
+
+      bc.d = rates[ri].open;
+      WriteRaw8(buffer, off + 8, bc);
+
+      bc.d = rates[ri].high;
+      WriteRaw8(buffer, off + 16, bc);
+
+      bc.d = rates[ri].low;
+      WriteRaw8(buffer, off + 24, bc);
+
+      bc.d = rates[ri].close;
+      WriteRaw8(buffer, off + 32, bc);
+
+      bc.d = (double)rates[ri].tick_volume;
+      WriteRaw8(buffer, off + 40, bc);
+   }
+}
+
 int GetTrackIndex(string key)
 {
    // Binary search if sorted
@@ -180,6 +254,51 @@ int GetTrackIndex(string key)
    g_trackTimes[g_trackCount - 1] = 0;
    g_trackSorted = false;
    return g_trackCount - 1;
+}
+
+// Persist last bar time to DB so we survive restarts
+void SaveTrackTime(string trackKey, datetime barTime)
+{
+   int req = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_track (key, last_bar_time) VALUES (?1, ?2)");
+   if(req != INVALID_HANDLE)
+   {
+      DatabaseBind(req, 0, trackKey);
+      DatabaseBind(req, 1, (long)barTime);
+      DatabaseRead(req);
+      DatabaseFinalize(req);
+   }
+}
+
+// Load existing key→timestamp mapping from DB so we don't re-export after restart
+void LoadTrackingFromDB()
+{
+   if(g_db == INVALID_HANDLE) return;
+
+   int req = DatabasePrepare(g_db,
+      "SELECT key, last_bar_time FROM bar_track");
+   if(req == INVALID_HANDLE) return;
+
+   int loaded = 0;
+   while(DatabaseRead(req))
+   {
+      string key = "";
+      long ts = 0;
+      DatabaseColumnText(req, 0, key);
+      DatabaseColumnLong(req, 1, ts);
+
+      if(ts <= 0) continue;
+      int idx = GetTrackIndex(key);
+      g_trackTimes[idx] = (datetime)ts;
+      loaded++;
+   }
+   DatabaseFinalize(req);
+
+   if(loaded > 0)
+   {
+      SortTrackArrays();
+      PrintFormat("BarCacheWriter: restored %d cached keys from DB (skip re-export on restart)", loaded);
+   }
 }
 
 int OnInit()
@@ -206,6 +325,20 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // Track last bar time per key — survives restarts so we skip unchanged data
+   if(!DatabaseExecute(g_db,
+      "CREATE TABLE IF NOT EXISTS bar_track ("
+      "  key TEXT PRIMARY KEY,"
+      "  last_bar_time INTEGER NOT NULL DEFAULT 0"
+      ")"))
+   {
+      PrintFormat("BarCacheWriter: bar_track create failed (error %d)", GetLastError());
+   }
+
+   // Covering index: lets readers get key/timestamp/bar_count from index alone,
+   // without scanning through multi-MB blob rows. Drops metadata queries from ~12s to <100ms.
+   DatabaseExecute(g_db, "CREATE INDEX IF NOT EXISTS idx_bar_meta ON bar_cache(key, timestamp, bar_count)");
+
    // Use DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary
    DatabaseExecute(g_db, "PRAGMA journal_mode=DELETE");
    DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
@@ -216,12 +349,16 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.315: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
-      CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
+   long acct = AccountInfoInteger(ACCOUNT_LOGIN);
+   g_accountTag = IntegerToString(acct);
+
+   // Restore tracking state from DB — survive restarts without re-exporting everything
+   LoadTrackingFromDB();
+
+   PrintFormat("BarCacheWriter v1.410: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
+      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate, MaxPendingPerTick, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
-   // No blocking full export on init — the timer handles everything incrementally,
-   // retrying pending symbols each tick (avoids hanging on 800+ CopyRates calls)
    return INIT_SUCCEEDED;
 }
 
@@ -233,19 +370,22 @@ void ExportAll(bool /*fullExport*/)
 
    uint tickStart = GetTickCount();
    int symCount = SymbolsTotal(MarketWatchOnly);
-   PrintFormat("BarCacheWriter: tick start — %d symbols", symCount);
+   static datetime lastTickLog = 0;
+   if(TimeCurrent() - lastTickLog > 300)
+   {
+      PrintFormat("BarCacheWriter: tick start — %d symbols", symCount);
+      lastTickLog = TimeCurrent();
+   }
 
    int exported = 0, skipped = 0, totalBars = 0;
    int skippedNative = 0;
    int pendingRetries = 0;        // count of pending full exports attempted this tick
-   int maxPendingPerTick = 50;    // non-blocking retries, can handle more per tick
 
-   // Batch all incremental writes into a single transaction
+   // Write metadata in its own short transaction
    SafeBegin();
-
-   // Write metadata
    WriteSymbolList(symCount);
    WriteSymbolSpecs(symCount);
+   SafeCommit();
    uint afterMeta = GetTickCount();
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
@@ -262,6 +402,9 @@ void ExportAll(bool /*fullExport*/)
          continue;
       }
 
+      // Per-symbol transaction — keeps lock hold time short so readers aren't blocked
+      SafeBegin();
+
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
          string trackKey = symbol + ":" + TFToStr(g_timeframes[tf]);
@@ -270,15 +413,16 @@ void ExportAll(bool /*fullExport*/)
          // Never synced — try to export whatever is locally available (non-blocking)
          if(g_trackTimes[idx] == 0)
          {
-            if(pendingRetries >= maxPendingPerTick) continue; // defer to next tick
+            if(pendingRetries >= MaxPendingPerTick) continue; // defer to next tick
             pendingRetries++;
 
             // Add to Market Watch (triggers background history download)
             SymbolSelect(symbol, true);
 
             // Non-blocking: use (start_pos, count) form which returns locally available data
-            // immediately without waiting for server download. 100000 = "give me everything you have"
-            int bars = ExportSymbolTF(symbol, g_timeframes[tf], 100000);
+            // immediately without waiting for server download.
+            // Tiered limits prevent OOM on lower timeframes (M1 capped at 10K vs old 100K)
+            int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]));
 
             if(bars > 0)
             {
@@ -286,7 +430,10 @@ void ExportAll(bool /*fullExport*/)
                totalBars += bars;
                MqlRates lastRate[];
                if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+               {
                   g_trackTimes[idx] = lastRate[0].time;
+                  SaveTrackTime(trackKey, lastRate[0].time);
+               }
             }
             continue;
          }
@@ -309,12 +456,15 @@ void ExportAll(bool /*fullExport*/)
             exported++;
             totalBars += bars;
             if(CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate) == 1)
+            {
                g_trackTimes[idx] = lastRate[0].time;
+               SaveTrackTime(trackKey, lastRate[0].time);
+            }
          }
       }
-   }
 
-   SafeCommit();
+      SafeCommit();
+   }
 
    // Sort tracking arrays after population phase for O(log n) lookups on subsequent ticks
    if(!g_trackSorted && g_trackCount > 0)
@@ -373,7 +523,7 @@ void WriteSymbolList(int symCount)
       "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
    if(req != INVALID_HANDLE)
    {
-      DatabaseBind(req, 0, "mt5:__SYMBOLS__");
+      DatabaseBind(req, 0, "mt5:__SYMBOLS__:" + g_accountTag);
       DatabaseBind(req, 1, "[\"" + StringReplace2(csv, ",", "\",\"") + "\"]");
       DatabaseBind(req, 2, (long)TimeCurrent());
       DatabaseBind(req, 3, (long)symCount);
@@ -447,7 +597,7 @@ void WriteSymbolSpecs(int symCount)
       "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
    if(req != INVALID_HANDLE)
    {
-      DatabaseBind(req, 0, "mt5:__SPECS__");
+      DatabaseBind(req, 0, "mt5:__SPECS__:" + g_accountTag);
       DatabaseBind(req, 1, csv);
       DatabaseBind(req, 2, (long)TimeCurrent());
       DatabaseBind(req, 3, (long)count);
@@ -462,95 +612,6 @@ string StringReplace2(string src, string find, string replace)
    string result = src;
    StringReplace(result, find, replace);
    return result;
-}
-
-// Chunked full export: fetches ALL bars, writes to DB in chunks of CHUNK_SIZE
-// Key format: "mt5:SYMBOL:TF:chunk_N" for N>0, "mt5:SYMBOL:TF" for chunk 0
-// This avoids building huge CSV strings that crash MQL5
-
-int ExportSymbolTFChunked(string symbol, ENUM_TIMEFRAMES tf)
-{
-   MqlRates rates[];
-   ArraySetAsSeries(rates, false);
-   SymbolSelect(symbol, true);
-
-   int copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
-   if(copied <= 0) return 0;
-
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   string baseKey = "mt5:" + symbol + ":" + TFToStr(tf);
-   int totalChunks = (int)MathCeil((double)copied / CHUNK_SIZE);
-
-   // No transaction here — caller (ExportAll) wraps everything in a single transaction.
-   // SQLite doesn't support nested transactions.
-
-   for(int chunk = 0; chunk < totalChunks; chunk++)
-   {
-      int startIdx = chunk * CHUNK_SIZE;
-      int endIdx = MathMin(startIdx + CHUNK_SIZE, copied);
-      int chunkBars = endIdx - startIdx;
-
-      // Build CSV for this chunk only
-      string csv = "";
-      StringInit(csv, chunkBars * 65);
-      csv = "";
-
-      for(int i = startIdx; i < endIdx; i++)
-      {
-         MqlDateTime mdt;
-         TimeToStruct(rates[i].time, mdt);
-         csv += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ,%s,%s,%s,%s,%s\n",
-            mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec,
-            DoubleToString(rates[i].open, digits),
-            DoubleToString(rates[i].high, digits),
-            DoubleToString(rates[i].low, digits),
-            DoubleToString(rates[i].close, digits),
-            IntegerToString(rates[i].tick_volume));
-      }
-
-      // chunk 0 = "mt5:EURUSD:1Day", chunk 1+ = "mt5:EURUSD:1Day:chunk_1"
-      string key = baseKey;
-      if(chunk > 0) key += ":chunk_" + IntegerToString(chunk);
-
-      int req = DatabasePrepare(g_db,
-         "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-      if(req != INVALID_HANDLE)
-      {
-         if(DatabaseBind(req, 0, key) &&
-            DatabaseBind(req, 1, csv) &&
-            DatabaseBind(req, 2, (long)TimeCurrent()) &&
-            DatabaseBind(req, 3, (long)chunkBars))
-         {
-            DatabaseRead(req);
-         }
-         DatabaseFinalize(req);
-      }
-   }
-
-   // Store total chunk count so reader knows how many to merge
-   if(totalChunks > 1)
-   {
-      int req = DatabasePrepare(g_db,
-         "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-      if(req != INVALID_HANDLE)
-      {
-         DatabaseBind(req, 0, baseKey + ":chunks");
-         DatabaseBind(req, 1, IntegerToString(totalChunks));
-         DatabaseBind(req, 2, (long)TimeCurrent());
-         DatabaseBind(req, 3, (long)copied);
-         DatabaseRead(req);
-         DatabaseFinalize(req);
-      }
-   }
-
-   static int chunkLog = 0;
-   if(chunkLog < 10)
-   {
-      PrintFormat("  CHUNKED OK: %s — %d bars in %d chunks", baseKey, copied, totalChunks);
-      chunkLog++;
-   }
-
-   return copied;
 }
 
 int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
@@ -578,31 +639,9 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
       return 0;
    }
 
-   // Build CSV: one line per bar, no header, no repeated key names
-   // Format: "2026-03-20T16:00:00Z,1.2345,1.2350,1.2340,1.2348,1234\n"
-   // This is 60% smaller than JSON and O(n) to build (no key names repeated)
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-   // Pre-allocate approximate size: ~60 chars per bar
-   // MQL5 doesn't have StringBuilder but string concat with += is optimized for append
-   string csv = "";
-   // Reserve hint (MQL5 may or may not optimize based on this)
-   StringInit(csv, copied * 65);
-   csv = "";
-
-   for(int i = 0; i < copied; i++)
-   {
-      MqlDateTime mdt;
-      TimeToStruct(rates[i].time, mdt);
-
-      csv += StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ,%s,%s,%s,%s,%s\n",
-         mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec,
-         DoubleToString(rates[i].open, digits),
-         DoubleToString(rates[i].high, digits),
-         DoubleToString(rates[i].low, digits),
-         DoubleToString(rates[i].close, digits),
-         IntegerToString(rates[i].tick_volume));
-   }
+   // Pack bars into TTBR binary format (48 bytes/bar, zero string overhead)
+   uchar buffer[];
+   PackBarsBinary(rates, 0, copied, buffer);
 
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
 
@@ -615,11 +654,11 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
    }
 
    if(!DatabaseBind(req, 0, key) ||
-      !DatabaseBind(req, 1, csv) ||
+      !DatabaseBindArray(req, 1, buffer) ||
       !DatabaseBind(req, 2, (long)TimeCurrent()) ||
       !DatabaseBind(req, 3, (long)copied))
    {
-      PrintFormat("  bind failed: %s (err %d, len=%d)", key, GetLastError(), StringLen(csv));
+      PrintFormat("  bind failed: %s (err %d, bytes=%d)", key, GetLastError(), ArraySize(buffer));
       DatabaseFinalize(req);
       return 0;
    }
@@ -630,7 +669,7 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
    static int writeOkLog = 0;
    if(writeOkLog < 5)
    {
-      PrintFormat("  DB WRITE OK: %s — %d bars, csv=%d chars", key, copied, StringLen(csv));
+      PrintFormat("  DB WRITE OK: %s — %d bars, %d bytes (binary)", key, copied, ArraySize(buffer));
       writeOkLog++;
    }
 
