@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.410"
+#property version   "1.411"
 #property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property description "v1.411: metadata writes every 5min (was every tick) — enables Rust mtime fast-path."
 #property description "v1.410: tiered bar limits per TF + configurable MaxPendingPerTick (OOM guard)."
 #property description "v1.400: binary TTBR format (48 bytes/bar, zero string overhead)."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
@@ -355,7 +356,7 @@ int OnInit()
    // Restore tracking state from DB — survive restarts without re-exporting everything
    LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.410: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
+   PrintFormat("BarCacheWriter v1.411: %s symbols(%d), %ds interval, %d bars/update, %d pending/tick, %d cached keys",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate, MaxPendingPerTick, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
@@ -381,11 +382,17 @@ void ExportAll(bool /*fullExport*/)
    int skippedNative = 0;
    int pendingRetries = 0;        // count of pending full exports attempted this tick
 
-   // Write metadata in its own short transaction
-   SafeBegin();
-   WriteSymbolList(symCount);
-   WriteSymbolSpecs(symCount);
-   SafeCommit();
+   // Write metadata only every 5 minutes (not every tick) — avoids unnecessary DB writes
+   // that change file mtime and prevent the Rust sync's fast-path mtime check
+   static datetime lastMetaWrite = 0;
+   if(lastMetaWrite == 0 || TimeCurrent() - lastMetaWrite >= 300)
+   {
+      SafeBegin();
+      WriteSymbolList(symCount);
+      WriteSymbolSpecs(symCount);
+      SafeCommit();
+      lastMetaWrite = TimeCurrent();
+   }
    uint afterMeta = GetTickCount();
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
