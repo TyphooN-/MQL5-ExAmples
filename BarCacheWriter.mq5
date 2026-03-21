@@ -33,6 +33,7 @@
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    MaxPendingPerTick = 10;     // Max full exports per tick (memory guard)
+input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -366,7 +367,18 @@ int OnInit()
    g_accountTag = IntegerToString(acct);
 
    // Restore tracking state from DB — survive restarts without re-exporting everything
-   LoadTrackingFromDB();
+   if(ForceReExport)
+   {
+      // Clear tracking table so all symbol/TFs are treated as "never exported"
+      DatabaseExecute(g_db, "DELETE FROM bar_track");
+      PrintFormat("BarCacheWriter: ForceReExport=true — cleared all tracking, full re-export queued");
+      g_trackCount = 0;
+      ArrayResize(g_trackKeys, 0);
+      ArrayResize(g_trackTimes, 0);
+      ArrayResize(g_trackFails, 0);
+   }
+   else
+      LoadTrackingFromDB();
 
    PrintFormat("BarCacheWriter v1.414: %s symbols(%d), %ds interval, full history, %d pending/tick, %d cached keys",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, MaxPendingPerTick, g_trackCount);
