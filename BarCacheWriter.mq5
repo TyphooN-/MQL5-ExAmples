@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.310"
+#property version   "1.311"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -164,7 +164,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.310: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.311: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
@@ -221,10 +221,16 @@ void ExportAll(bool fullExport)
             }
          }
 
-         // Fetch ALL bars chunked (full) or recent bars (incremental)
+         // Fetch bars: full export for init OR symbols never synced, incremental for the rest
          int bars;
-         if(fullExport)
+         bool needsFull = fullExport || (g_trackTimes[idx] == 0);
+         if(needsFull)
+         {
+            // Break out of the batched incremental transaction for a full chunked write
+            if(!fullExport) SafeCommit();
             bars = ExportSymbolTFChunked(symbol, g_timeframes[tf]);
+            if(!fullExport) SafeBegin();
+         }
          else
             bars = ExportSymbolTF(symbol, g_timeframes[tf], BarsPerUpdate);
 
@@ -245,6 +251,11 @@ void ExportAll(bool fullExport)
    // Commit the single incremental transaction
    if(!fullExport) SafeCommit();
 
+   // Count symbols still pending (never successfully exported any TF)
+   int pendingSymbols = 0;
+   for(int i = 0; i < g_trackCount; i++)
+      if(g_trackTimes[i] == 0) pendingSymbols++;
+
    static datetime lastLog = 0;
    static bool first = true;
    static int failCount = 0;
@@ -254,11 +265,11 @@ void ExportAll(bool fullExport)
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
       if(fullExport)
-         PrintFormat("BarCacheWriter: FULL — %d exported, %d skipped(shared), %d bars, %d symbols",
-            exported, skippedNative, totalBars, symCount);
+         PrintFormat("BarCacheWriter: FULL — %d exported, %d skipped(shared), %d bars, %d symbols, %d pending",
+            exported, skippedNative, totalBars, symCount, pendingSymbols);
       else
-         PrintFormat("BarCacheWriter: incremental — %d exported, %d skipped(unchanged), %d bars, %d symbols",
-            exported, skipped, totalBars, symCount);
+         PrintFormat("BarCacheWriter: incremental — %d exported, %d skipped(unchanged), %d bars, %d symbols, %d pending",
+            exported, skipped, totalBars, symCount, pendingSymbols);
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
