@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.306"
+#property version   "1.307"
 #property description "Writes bar data + symbol specs to SQLite using CSV format."
 #property description "v1.300: adds __SPECS__ export (Sector, Industry, TradeMode, Swaps, Spread)."
 #property strict
@@ -104,28 +104,19 @@ bool SafeCommit()
 // Detect whether this is a specialized account (crypto/futures) that should skip forex pairs.
 // Forex pairs appear on ALL Darwinex accounts — the main CFD account exports them,
 // so crypto and futures accounts should skip them to avoid redundant writes.
+// Detection: the main CFD account has 100+ symbols (forex + commodities + stocks + ETFs).
+// Specialized accounts (crypto, futures) have far fewer (<100).
 bool g_skipForex = false;
 
 void DetectAccountType(int symCount)
 {
-   int forexCount = 0, cryptoCount = 0, futuresCount = 0, stockCount = 0;
-   for(int i = 0; i < symCount; i++)
-   {
-      string sym = SymbolName(i, MarketWatchOnly);
-      string sector = "";
-      if(!SymbolInfoString(sym, SYMBOL_SECTOR_NAME, sector)) continue;
-      if(sector == "Currency") forexCount++;
-      else if(sector == "Crypto" || sector == "Cryptocurrency") cryptoCount++;
-      else if(sector == "Indexes" || sector == "Commodity" || sector == "Energy") futuresCount++;
-      else stockCount++;
-   }
+   // The main CFD account has hundreds of symbols (stocks, ETFs, commodities, forex).
+   // Specialized accounts (crypto ~10, futures ~40) have far fewer.
+   g_skipForex = (symCount < 100);
 
-   // If this account has ANY crypto or futures symbols, it's a specialized account —
-   // the main CFD account (forex + commodities + stocks) handles forex export.
-   g_skipForex = (cryptoCount > 0 || futuresCount > 0);
-
-   PrintFormat("BarCacheWriter: %s forex (forex=%d, crypto=%d, futures=%d, stocks=%d)",
-      g_skipForex ? "SKIPPING" : "EXPORTING", forexCount, cryptoCount, futuresCount, stockCount);
+   PrintFormat("BarCacheWriter: %s forex (%d symbols — %s account)",
+      g_skipForex ? "SKIPPING" : "EXPORTING", symCount,
+      g_skipForex ? "specialized" : "main CFD");
 }
 
 bool IsNativeSymbol(string symbol)
@@ -212,7 +203,7 @@ int OnInit()
    int initSymCount = SymbolsTotal(MarketWatchOnly);
    DetectAccountType(initSymCount);
 
-   PrintFormat("BarCacheWriter v1.306: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
+   PrintFormat("BarCacheWriter v1.307: chunked(%d), %s symbols(%d), %ds interval, %d bars/update",
       CHUNK_SIZE, MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BarsPerUpdate);
 
    EventSetTimer(UpdateIntervalSec);
