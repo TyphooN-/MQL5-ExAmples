@@ -450,6 +450,18 @@ void ExportAll()
                skipped++;
                continue;
             }
+            // Fast pre-check: if broker has zero bars locally, skip without wasting a retry slot
+            if(Bars(symbol, g_timeframes[tf]) == 0)
+            {
+               g_trackFails[idx]++;
+               if(g_trackFails[idx] >= MAX_CONSEC_FAILS)
+               {
+                  g_trackTimes[idx] = (datetime)FAIL_SENTINEL;
+                  SaveTrackTime(trackKey, (datetime)FAIL_SENTINEL);
+                  PrintFormat("BarCacheWriter: giving up on %s (no bars available after %d checks)", trackKey, MAX_CONSEC_FAILS);
+               }
+               continue;
+            }
             if(pendingRetries >= MaxPendingPerTick) continue; // defer to next tick
             pendingRetries++;
 
