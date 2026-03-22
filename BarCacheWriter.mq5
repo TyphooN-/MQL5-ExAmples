@@ -23,20 +23,24 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.414"
-#property description "Writes bar data (TTBR binary) + symbol specs to SQLite."
+#property version   "1.418"
+#property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
+#property description "v1.416: Remove forex filtering — all instances export all symbols, dedup in Rust."
 #property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
-#property description "v1.413: Bars() pre-check + give up after 10 failures per symbol/TF."
 #property strict
 
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
-input int    MaxPendingPerTick = 10;     // Max full exports per tick (memory guard)
+input int    BatchSize         = 20;     // Symbols per SQLite transaction (batching reduces fsync overhead)
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
+int g_stmtBarInsert = INVALID_HANDLE;   // Pre-prepared INSERT OR REPLACE for bar_cache
+int g_stmtTrackInsert = INVALID_HANDLE; // Pre-prepared INSERT OR REPLACE for bar_track
+int g_stmtQuoteInsert = INVALID_HANDLE; // Pre-prepared INSERT OR REPLACE for bid_ask
 
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
@@ -73,35 +77,9 @@ bool SafeCommit()
    return true;
 }
 
-// Detect whether this is a specialized account (crypto/futures) that should skip forex pairs.
-// Forex pairs appear on ALL Darwinex accounts — the main CFD account exports them,
-// so crypto and futures accounts should skip them to avoid redundant writes.
-// Detection: the main CFD account has 100+ symbols (forex + commodities + stocks + ETFs).
-// Specialized accounts (crypto, futures) have far fewer (<100).
-bool g_skipForex = false;
-
-void DetectAccountType(int symCount)
-{
-   // The main CFD account has hundreds of symbols (stocks, ETFs, commodities, forex).
-   // Specialized accounts (crypto ~10, futures ~40) have far fewer.
-   g_skipForex = (symCount < 100);
-
-   PrintFormat("BarCacheWriter: %s forex (%d symbols — %s account)",
-      g_skipForex ? "SKIPPING" : "EXPORTING", symCount,
-      g_skipForex ? "specialized" : "main CFD");
-}
-
-bool IsNativeSymbol(string symbol)
-{
-   if(!g_skipForex) return true;
-
-   string sector = "";
-   if(SymbolInfoString(symbol, SYMBOL_SECTOR_NAME, sector))
-   {
-      if(sector == "Currency") return false;
-   }
-   return true;
-}
+// All instances export all symbols — dedup handled by Rust sync (norm_key + seen_keys set).
+// Removing per-instance forex filtering simplifies the EA and ensures every instance
+// has a complete dataset for portable backup/restore.
 
 // Timeframes: MN1 first (higher TFs are smaller, export fast)
 ENUM_TIMEFRAMES g_timeframes[] = {
@@ -268,15 +246,11 @@ int GetTrackIndex(string key)
 // Persist last bar time to DB so we survive restarts
 void SaveTrackTime(string trackKey, datetime barTime)
 {
-   int req = DatabasePrepare(g_db,
-      "INSERT OR REPLACE INTO bar_track (key, last_bar_time) VALUES (?1, ?2)");
-   if(req != INVALID_HANDLE)
-   {
-      DatabaseBind(req, 0, trackKey);
-      DatabaseBind(req, 1, (long)barTime);
-      DatabaseRead(req);
-      DatabaseFinalize(req);
-   }
+   if(g_stmtTrackInsert == INVALID_HANDLE) return;
+   DatabaseReset(g_stmtTrackInsert);
+   DatabaseBind(g_stmtTrackInsert, 0, trackKey);
+   DatabaseBind(g_stmtTrackInsert, 1, (long)barTime);
+   DatabaseRead(g_stmtTrackInsert);
 }
 
 // Load existing key→timestamp mapping from DB so we don't re-export after restart
@@ -345,6 +319,19 @@ int OnInit()
       PrintFormat("BarCacheWriter: bar_track create failed (error %d)", GetLastError());
    }
 
+   // Live bid/ask table — flat, always 1 row per symbol (INSERT OR REPLACE)
+   if(!DatabaseExecute(g_db,
+      "CREATE TABLE IF NOT EXISTS bid_ask ("
+      "  symbol TEXT PRIMARY KEY,"
+      "  bid REAL NOT NULL DEFAULT 0,"
+      "  ask REAL NOT NULL DEFAULT 0,"
+      "  spread REAL NOT NULL DEFAULT 0,"
+      "  timestamp INTEGER NOT NULL DEFAULT 0"
+      ")"))
+   {
+      PrintFormat("BarCacheWriter: bid_ask create failed (error %d)", GetLastError());
+   }
+
    // Covering index: lets readers get key/timestamp/bar_count from index alone,
    // without scanning through multi-MB blob rows. Drops metadata queries from ~12s to <100ms.
    DatabaseExecute(g_db, "CREATE INDEX IF NOT EXISTS idx_bar_meta ON bar_cache(key, timestamp, bar_count)");
@@ -355,13 +342,27 @@ int OnInit()
    DatabaseExecute(g_db, "PRAGMA cache_size=-8000"); // 8MB page cache
    DatabaseExecute(g_db, "PRAGMA busy_timeout=5000"); // Wait up to 5s for lock instead of failing
 
+   // Pre-prepare statements — avoids re-parsing SQL on every write (851 symbols × 9 TFs per tick)
+   g_stmtBarInsert = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   if(g_stmtBarInsert == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare bar insert stmt (err %d)", GetLastError());
+
+   g_stmtTrackInsert = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_track (key, last_bar_time) VALUES (?1, ?2)");
+   if(g_stmtTrackInsert == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare track insert stmt (err %d)", GetLastError());
+
+   g_stmtQuoteInsert = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bid_ask (symbol, bid, ask, spread, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)");
+   if(g_stmtQuoteInsert == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare quote insert stmt (err %d)", GetLastError());
+
    // Cache TF strings once — eliminates switch evaluation per symbol×TF per tick
    for(int t = 0; t < ArraySize(g_timeframes); t++)
       g_tfStrings[t] = TFToStr(g_timeframes[t]);
 
-   // Detect which sector this instance primarily serves
    int initSymCount = SymbolsTotal(MarketWatchOnly);
-   DetectAccountType(initSymCount);
 
    long acct = AccountInfoInteger(ACCOUNT_LOGIN);
    g_accountTag = IntegerToString(acct);
@@ -380,8 +381,8 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.414: %s symbols(%d), %ds interval, full history, %d pending/tick, %d cached keys",
-      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, MaxPendingPerTick, g_trackCount);
+   PrintFormat("BarCacheWriter v1.417: %s symbols(%d), %ds interval, batch=%d, %d cached keys, no pending cap",
+      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
@@ -403,8 +404,6 @@ void ExportAll()
    }
 
    int exported = 0, skipped = 0, totalBars = 0;
-   int skippedNative = 0;
-   int pendingRetries = 0;        // count of pending full exports attempted this tick
 
    // Write metadata only every 5 minutes (not every tick) — avoids unnecessary DB writes
    // that change file mtime and prevent the Rust sync's fast-path mtime check
@@ -421,23 +420,49 @@ void ExportAll()
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
 
+   // Live bid/ask sync — all symbols, every tick, flat table (895 rows max)
+   if(g_stmtQuoteInsert != INVALID_HANDLE)
+   {
+      SafeBegin();
+      long now = (long)TimeCurrent();
+      int quoteCount = 0;
+      for(int q = 0; q < symCount; q++)
+      {
+         string qSym = SymbolName(q, MarketWatchOnly);
+         if(StringLen(qSym) == 0) continue;
+         double bid = SymbolInfoDouble(qSym, SYMBOL_BID);
+         double ask = SymbolInfoDouble(qSym, SYMBOL_ASK);
+         if(bid <= 0 && ask <= 0) continue; // no quote data
+         double spread = (ask > 0 && bid > 0) ? (ask - bid) : 0;
+         DatabaseReset(g_stmtQuoteInsert);
+         DatabaseBind(g_stmtQuoteInsert, 0, qSym);
+         DatabaseBind(g_stmtQuoteInsert, 1, bid);
+         DatabaseBind(g_stmtQuoteInsert, 2, ask);
+         DatabaseBind(g_stmtQuoteInsert, 3, spread);
+         DatabaseBind(g_stmtQuoteInsert, 4, now);
+         if(DatabaseRead(g_stmtQuoteInsert)) quoteCount++;
+      }
+      SafeCommit();
+   }
+
+   int batchCount = 0;  // symbols in current transaction batch
+   bool inTxn = false;
+
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
 
-      // Skip shared forex pairs on non-forex instances
-      if(!IsNativeSymbol(symbol))
-      {
-         skippedNative += ArraySize(g_timeframes);
-         continue;
-      }
-
       // Select once per symbol — covers all TFs (was duplicated inside ExportSymbolTF)
       SymbolSelect(symbol, true);
 
-      // Per-symbol transaction — keeps lock hold time short so readers aren't blocked
-      SafeBegin();
+      // Batched transactions — group BatchSize symbols per BEGIN/COMMIT to reduce fsync overhead
+      if(!inTxn)
+      {
+         SafeBegin();
+         inTxn = true;
+         batchCount = 0;
+      }
 
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
@@ -469,9 +494,6 @@ void ExportAll()
                }
                continue;
             }
-            if(pendingRetries >= MaxPendingPerTick) continue; // defer to next tick
-            pendingRetries++;
-
             // Non-blocking: use (start_pos, count) form which returns locally available data
             // immediately without waiting for server download.
             // Tiered limits prevent OOM on lower timeframes (M1 capped at 10K vs old 100K)
@@ -524,8 +546,16 @@ void ExportAll()
          }
       }
 
-      SafeCommit();
+      batchCount++;
+      if(batchCount >= BatchSize)
+      {
+         SafeCommit();
+         inTxn = false;
+      }
    }
+
+   // Commit any remaining symbols in the last partial batch
+   if(inTxn) SafeCommit();
 
    // Sort tracking arrays after population phase for O(log n) lookups on subsequent ticks
    if(!g_trackSorted && g_trackCount > 0)
@@ -549,8 +579,8 @@ void ExportAll()
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
       uint elapsed = GetTickCount() - tickStart;
-      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending (%d retried) | %dms",
-         exported, skipped, totalBars, pendingSlots, pendingRetries, elapsed);
+      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending | %dms",
+         exported, skipped, totalBars, pendingSlots, elapsed);
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
@@ -594,6 +624,22 @@ void WriteSymbolList(int symCount)
       DatabaseBind(req, 3, (long)symCount);
       DatabaseRead(req);
       DatabaseFinalize(req);
+   }
+
+   // Store broker/server identity — TyphooN-Terminal reads this for data source badge
+   int srvReq = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   if(srvReq != INVALID_HANDLE)
+   {
+      string server = AccountInfoString(ACCOUNT_SERVER);
+      string company = AccountInfoString(ACCOUNT_COMPANY);
+      string meta = "{\"server\":\"" + server + "\",\"company\":\"" + company + "\"}";
+      DatabaseBind(srvReq, 0, "mt5:__SERVER__:" + g_accountTag);
+      DatabaseBind(srvReq, 1, meta);
+      DatabaseBind(srvReq, 2, (long)TimeCurrent());
+      DatabaseBind(srvReq, 3, 0);
+      DatabaseRead(srvReq);
+      DatabaseFinalize(srvReq);
    }
 }
 
@@ -709,26 +755,25 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
 
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
 
-   int req = DatabasePrepare(g_db,
-      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   // Use pre-prepared statement (reset+rebind is ~10× faster than prepare+finalize per call)
+   int req = g_stmtBarInsert;
    if(req == INVALID_HANDLE)
    {
-      PrintFormat("  prepare failed: %s (err %d)", key, GetLastError());
+      PrintFormat("  bar insert stmt not available: %s", key);
       return 0;
    }
 
+   DatabaseReset(req);
    if(!DatabaseBind(req, 0, key) ||
       !DatabaseBindArray(req, 1, buffer) ||
       !DatabaseBind(req, 2, (long)TimeCurrent()) ||
       !DatabaseBind(req, 3, (long)copied))
    {
       PrintFormat("  bind failed: %s (err %d, bytes=%d)", key, GetLastError(), ArraySize(buffer));
-      DatabaseFinalize(req);
       return 0;
    }
 
    DatabaseRead(req);
-   DatabaseFinalize(req);
 
    static int writeOkLog = 0;
    if(writeOkLog < 5)
@@ -743,6 +788,9 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(g_stmtBarInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtBarInsert); g_stmtBarInsert = INVALID_HANDLE; }
+   if(g_stmtTrackInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtTrackInsert); g_stmtTrackInsert = INVALID_HANDLE; }
+   if(g_stmtQuoteInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtQuoteInsert); g_stmtQuoteInsert = INVALID_HANDLE; }
    if(g_db != INVALID_HANDLE)
    {
       DatabaseClose(g_db);
