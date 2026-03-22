@@ -381,7 +381,7 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.417: %s symbols(%d), %ds interval, batch=%d, %d cached keys, no pending cap",
+   PrintFormat("BarCacheWriter v1.418: %s symbols(%d), %ds interval, batch=%d, %d cached keys, no pending cap",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount);
 
    EventSetTimer(UpdateIntervalSec);
