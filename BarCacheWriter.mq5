@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.418"
+#property version   "1.420"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.420: Unlimited bar export — 100% of server history (MaxBarsForTF=0)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
 #property description "v1.416: Remove forex filtering — all instances export all symbols, dedup in Rust."
 #property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
@@ -89,23 +90,14 @@ ENUM_TIMEFRAMES g_timeframes[] = {
 // Pre-cached TF strings — avoids 7,659 switch evaluations per tick
 string g_tfStrings[9];
 
-// Max bars for initial full export per timeframe — prevents OOM on lower TFs
-// M1: 10K bars = 480KB, M5: 20K = 960KB, vs old 100K = 4.8MB per entry
+// Max bars per timeframe — 0 = ALL available history from server (no limit)
+// Uses CopyRates(symbol, tf, D'1970.01.01', TimeCurrent(), rates) for full history
 int MaxBarsForTF(ENUM_TIMEFRAMES tf)
 {
-   switch(tf)
-   {
-      case PERIOD_MN1: return 1000;
-      case PERIOD_W1:  return 2000;
-      case PERIOD_D1:  return 10000;
-      case PERIOD_H4:  return 20000;
-      case PERIOD_H1:  return 50000;
-      case PERIOD_M30: return 50000;
-      case PERIOD_M15: return 50000;
-      case PERIOD_M5:  return 20000;
-      case PERIOD_M1:  return 10000;
-   }
-   return 10000;
+   // Return 0 for all TFs → unlimited (100% of server history)
+   // MT5 terminal "Max bars in chart" setting determines actual ceiling
+   // Monitor MT5 memory usage; if OOM occurs, set limits per-TF here
+   return 0;
 }
 
 string TFToStr(ENUM_TIMEFRAMES tf)
@@ -494,9 +486,8 @@ void ExportAll()
                }
                continue;
             }
-            // Non-blocking: use (start_pos, count) form which returns locally available data
-            // immediately without waiting for server download.
-            // Tiered limits prevent OOM on lower timeframes (M1 capped at 10K vs old 100K)
+            // Unlimited: maxBars=0 fetches ALL available history from server
+            // Monitor MT5 memory if OOM occurs on M1 with millions of bars
             int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]));
 
             if(bars > 0)
@@ -531,8 +522,8 @@ void ExportAll()
             continue;
          }
 
-         // Incremental: re-export full local history so older bars aren't truncated.
-         // Uses same tiered limits as initial export — all locally cached data.
+         // Incremental: re-export full server history (unlimited).
+         // maxBars=0 → CopyRates fetches ALL available history from 1970 to now.
          int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]));
          if(bars > 0)
          {
