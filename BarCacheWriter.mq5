@@ -23,11 +23,11 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.420"
+#property version   "1.422"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.420: Unlimited bar export — 100% of server history (MaxBarsForTF=0)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
-#property description "v1.416: Remove forex filtering — all instances export all symbols, dedup in Rust."
 #property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
 #property strict
 
@@ -78,9 +78,27 @@ bool SafeCommit()
    return true;
 }
 
-// All instances export all symbols — dedup handled by Rust sync (norm_key + seen_keys set).
-// Removing per-instance forex filtering simplifies the EA and ensures every instance
-// has a complete dataset for portable backup/restore.
+// Forex filtering: only export forex symbols on the CFD server (detected by USDMXN availability).
+// Crypto and Futures servers don't need EURGBP/EURUSD/GBPUSD cluttering the cache.
+bool g_isCFDServer = false;
+
+bool IsForexSymbol(string symbol)
+{
+   // Common forex pairs — 6-char symbols like EURUSD, GBPJPY, etc.
+   // Also catches exotics like USDMXN, USDZAR, etc.
+   int len = StringLen(symbol);
+   if(len != 6) return false;
+   string majors[] = {"USD","EUR","GBP","JPY","CHF","AUD","NZD","CAD","SEK","NOK","MXN","ZAR","TRY","PLN","HUF","CZK","SGD","HKD","DKK"};
+   string base = StringSubstr(symbol, 0, 3);
+   string quote = StringSubstr(symbol, 3, 3);
+   bool baseIsCcy = false, quoteIsCcy = false;
+   for(int i = 0; i < ArraySize(majors); i++)
+   {
+      if(base == majors[i]) baseIsCcy = true;
+      if(quote == majors[i]) quoteIsCcy = true;
+   }
+   return (baseIsCcy && quoteIsCcy);
+}
 
 // Timeframes: MN1 first (higher TFs are smaller, export fast)
 ENUM_TIMEFRAMES g_timeframes[] = {
@@ -359,6 +377,12 @@ int OnInit()
    long acct = AccountInfoInteger(ACCOUNT_LOGIN);
    g_accountTag = IntegerToString(acct);
 
+   // Detect CFD server by checking if USDMXN exists — only CFD servers have exotic forex
+   g_isCFDServer = (SymbolInfoInteger("USDMXN", SYMBOL_EXIST) == 1);
+   PrintFormat("BarCacheWriter: server type = %s (USDMXN %s)",
+      g_isCFDServer ? "CFD (forex enabled)" : "Crypto/Futures (forex SKIPPED)",
+      g_isCFDServer ? "found" : "not found");
+
    // Restore tracking state from DB — survive restarts without re-exporting everything
    if(ForceReExport)
    {
@@ -444,6 +468,9 @@ void ExportAll()
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
+
+      // Skip forex symbols on non-CFD servers (crypto/futures don't need EURUSD etc.)
+      if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
       // Select once per symbol — covers all TFs (was duplicated inside ExportSymbolTF)
       SymbolSelect(symbol, true);
