@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.422"
+#property version   "1.424"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
-#property description "v1.420: Unlimited bar export — 100% of server history (MaxBarsForTF=0)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
 #property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
 #property strict
@@ -112,10 +112,10 @@ string g_tfStrings[9];
 // Uses CopyRates(symbol, tf, D'1970.01.01', TimeCurrent(), rates) for full history
 int MaxBarsForTF(ENUM_TIMEFRAMES tf)
 {
-   // Return 0 for all TFs → unlimited (100% of server history)
-   // MT5 terminal "Max bars in chart" setting determines actual ceiling
-   // Monitor MT5 memory usage; if OOM occurs, set limits per-TF here
-   return 0;
+   // Cap all timeframes at 100,000 bars to prevent OOM and export hangs.
+   // 100K bars covers: M1=~69 days, M5=~347 days, M15=~1041 days,
+   // M30=~2083 days, H1=~11.4 years, H4=~45 years, D1/W1/MN1=all history
+   return 100000;
 }
 
 string TFToStr(ENUM_TIMEFRAMES tf)
