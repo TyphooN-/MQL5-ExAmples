@@ -25,7 +25,7 @@
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.426"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
-#property description "v1.426: Incremental sync — reads last 10 bars, appends only new (10000x faster)."
+#property description "v1.426: Incremental sync — dynamic fetch (elapsed/period+2), append only new bars."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
