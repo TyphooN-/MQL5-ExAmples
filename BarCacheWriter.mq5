@@ -397,8 +397,9 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.420: %s symbols(%d), %ds interval, batch=%d, %d cached keys, no pending cap",
-      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount);
+   PrintFormat("BarCacheWriter v1.424: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 100K bar cap, forex=%s",
+      MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
+      g_isCFDServer ? "ENABLED" : "SKIPPED");
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
