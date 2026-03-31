@@ -471,7 +471,7 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.426: %s symbols(%d), %ds interval, batch=%d, %d cached keys, incremental sync, forex=%s",
+   PrintFormat("BarCacheWriter v1.427: %s symbols(%d), %ds interval, batch=%d, %d cached keys, SQL BLOB append, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
