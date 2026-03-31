@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.426"
+#property version   "1.427"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.427: SQL BLOB append — no full blob round-trip. Only delta bytes cross MQL5/SQLite boundary."
 #property description "v1.426: Incremental sync — dynamic fetch (elapsed/period+2), append only new bars."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
@@ -40,9 +41,18 @@ input bool   ForceReExport     = false;  // true = clear tracking, re-export all
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
-int g_stmtBarInsert = INVALID_HANDLE;   // Pre-prepared INSERT OR REPLACE for bar_cache
-int g_stmtTrackInsert = INVALID_HANDLE; // Pre-prepared INSERT OR REPLACE for bar_track
-int g_stmtQuoteInsert = INVALID_HANDLE; // Pre-prepared INSERT OR REPLACE for bid_ask
+int g_stmtBarInsert = INVALID_HANDLE;       // Pre-prepared INSERT OR REPLACE for bar_cache (full export)
+int g_stmtTrackInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bar_track
+int g_stmtQuoteInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bid_ask
+int g_stmtBarCountRead = INVALID_HANDLE;    // SELECT bar_count FROM bar_cache WHERE key=?1 (index-only, no blob read)
+// SQL UPDATE statements that manipulate the BLOB server-side — only the 48-byte delta
+// crosses the MQL5/SQLite boundary instead of the full 4.8MB blob every call.
+// SUBSTR is 1-indexed in SQLite. Bar data layout: [4 magic][4 count LE][N*48 bars]
+//   All bars except last: SUBSTR(data, 9, LENGTH(data)-56)   (from byte 9, length=total-8header-48lastbar)
+//   Last bar only:        SUBSTR(data, LENGTH(data)-47, 48)  (last 48 bytes)
+int g_stmtUpdateLastBar = INVALID_HANDLE;   // update last bar in-place (forming bar close changes)
+int g_stmtReplaceLastAndAppend = INVALID_HANDLE; // replace last bar + append new bars
+int g_stmtAppendOnly = INVALID_HANDLE;      // append new bars without touching last bar
 
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
@@ -227,6 +237,38 @@ void PackBarsBinary(const MqlRates &rates[], int startIdx, int count, uchar &buf
    }
 }
 
+// Pack a single MqlRates bar into a 48-byte TTBR bar record.
+// buf must be pre-allocated to at least off+48 bytes.
+void PackSingleBar(uchar &buf[], int off, const MqlRates &r)
+{
+   ByteConv bc;
+   bc.l = (long)r.time * 1000;  WriteRaw8(buf, off,      bc);
+   bc.d = r.open;               WriteRaw8(buf, off +  8, bc);
+   bc.d = r.high;               WriteRaw8(buf, off + 16, bc);
+   bc.d = r.low;                WriteRaw8(buf, off + 24, bc);
+   bc.d = r.close;              WriteRaw8(buf, off + 32, bc);
+   bc.d = (double)r.tick_volume; WriteRaw8(buf, off + 40, bc);
+}
+
+// Build a BLOB of count*48 bytes from rates[start .. start+count-1].
+// Used for the "new bars to append" payload in SQL UPDATE statements.
+void PackBarsBlob(const MqlRates &rates[], int start, int count, uchar &buf[])
+{
+   ArrayResize(buf, count * 48);
+   for(int i = 0; i < count; i++)
+      PackSingleBar(buf, i * 48, rates[start + i]);
+}
+
+// Encode an int as 4-byte little-endian blob (for TTBR bar count field).
+void EncodeLE4(int v, uchar &buf[])
+{
+   ArrayResize(buf, 4);
+   buf[0] = (uchar)(v & 0xFF);
+   buf[1] = (uchar)((v >>  8) & 0xFF);
+   buf[2] = (uchar)((v >> 16) & 0xFF);
+   buf[3] = (uchar)((v >> 24) & 0xFF);
+}
+
 int GetTrackIndex(string key)
 {
    // Binary search if sorted
@@ -368,6 +410,37 @@ int OnInit()
       "INSERT OR REPLACE INTO bid_ask (symbol, bid, ask, spread, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)");
    if(g_stmtQuoteInsert == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare quote insert stmt (err %d)", GetLastError());
+
+   // Index-only read: bar_count is in the covering index, never touches the blob page.
+   // Used to check existence and get current count before SQL BLOB UPDATE.
+   g_stmtBarCountRead = DatabasePrepare(g_db,
+      "SELECT bar_count FROM bar_cache WHERE key = ?1");
+   if(g_stmtBarCountRead == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare bar count read stmt (err %d)", GetLastError());
+
+   // Update last bar in-place: replaces the final 48 bytes of the BLOB.
+   // Used every cycle for each active symbol/TF to refresh the forming bar's close.
+   // SQLite reads LENGTH() from the page header and writes only the changed tail bytes —
+   // the rest of the blob is unmodified. Zero MQL5 memory for the existing bars.
+   g_stmtUpdateLastBar = DatabasePrepare(g_db,
+      "UPDATE bar_cache SET data = SUBSTR(data,1,LENGTH(data)-48)||?1, timestamp=?2 WHERE key=?3");
+   if(g_stmtUpdateLastBar == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare update-last-bar stmt (err %d)", GetLastError());
+
+   // Replace last bar + append new bars.
+   // Params: ?1=4-byte LE count, ?2=48-byte updated last bar, ?3=new bars blob, ?4=new count, ?5=ts, ?6=key
+   // SUBSTR breakdown: magic(4) || newCount(4) || allBarsExceptLast || newLastBar || newBars
+   g_stmtReplaceLastAndAppend = DatabasePrepare(g_db,
+      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||?1||SUBSTR(data,9,LENGTH(data)-56)||?2||?3, bar_count=?4, timestamp=?5 WHERE key=?6");
+   if(g_stmtReplaceLastAndAppend == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare replace-last-and-append stmt (err %d)", GetLastError());
+
+   // Append new bars only (no last-bar update — timestamps in new batch start past existing last).
+   // Params: ?1=4-byte LE count, ?2=new bars blob, ?3=new count, ?4=ts, ?5=key
+   g_stmtAppendOnly = DatabasePrepare(g_db,
+      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||?1||SUBSTR(data,9)||?2, bar_count=?3, timestamp=?4 WHERE key=?5");
+   if(g_stmtAppendOnly == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare append-only stmt (err %d)", GetLastError());
 
    // Cache TF strings once — eliminates switch evaluation per symbol×TF per tick
    for(int t = 0; t < ArraySize(g_timeframes); t++)
@@ -758,11 +831,21 @@ void ReadRaw8(const uchar &buf[], int off, ByteConv &bc)
    bc.b[4] = buf[off+4]; bc.b[5] = buf[off+5]; bc.b[6] = buf[off+6]; bc.b[7] = buf[off+7];
 }
 
+// ── v1.427 Incremental Export — SQL BLOB manipulation ────────────────────────
+// Previous approach: read full blob (up to 4.8MB) into MQL5, ArrayCopy, write back.
+// New approach: only the delta (48 bytes × new bars) crosses the MQL5/SQLite boundary.
+// SQLite's SUBSTR slices the existing blob entirely server-side.
+//
+// Three SQL UPDATE cases, all via pre-prepared statements:
+//   g_stmtUpdateLastBar       — forming bar close update only (appendCount == 0)
+//   g_stmtReplaceLastAndAppend — matched last bar + N new bars (newStart > 0)
+//   g_stmtAppendOnly          — N new bars from a timestamp beyond existing last (newStart == 0)
+//
+// Bar count for the new header is read from the covering index (g_stmtBarCountRead) —
+// an index-only scan that never touches the blob page.
 int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSyncTime)
 {
-   // Dynamic fetch: calculate exactly how many bars elapsed since last sync.
-   // E.g., last sync was 3 H1 bars ago → fetch 5 (3 + 2 overlap for safety).
-   // Minimum 3 (current bar + previous + safety), maximum 200 (cap for edge cases).
+   // Dynamic fetch: bars elapsed since last sync + 2 overlap for safety.
    int tfSeconds = PeriodSeconds(tf);
    int elapsed = (int)(TimeCurrent() - lastSyncTime);
    int estimatedNewBars = (tfSeconds > 0) ? (elapsed / tfSeconds) + 2 : 10;
@@ -775,49 +858,26 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
 
    string key = "mt5:" + symbol + ":" + TFToStr(tf);
 
-   // Read existing blob from DB
-   int readStmt = DatabasePrepare(g_db, "SELECT data FROM bar_cache WHERE key = ?1");
-   if(readStmt == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0); // fallback to full export
-
-   DatabaseBind(readStmt, 0, key);
-   uchar existingBlob[];
-   bool hasExisting = false;
-   if(DatabaseRead(readStmt))
+   // ── Step 1: read bar_count only (index-only scan, never loads blob page) ──
+   if(g_stmtBarCountRead == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0);
+   DatabaseReset(g_stmtBarCountRead);
+   DatabaseBind(g_stmtBarCountRead, 0, key);
+   int existingCount = 0;
+   if(!DatabaseRead(g_stmtBarCountRead))
    {
-      DatabaseColumnBlob(readStmt, 0, existingBlob);
-      hasExisting = (ArraySize(existingBlob) >= 8);
-   }
-   DatabaseFinalize(readStmt);
-
-   if(!hasExisting)
-   {
-      // No existing data — do full export instead
+      // Key not in DB — full export
       return ExportSymbolTF(symbol, tf, 0);
    }
+   DatabaseColumnInteger(g_stmtBarCountRead, 0, existingCount);
+   if(existingCount <= 0) return ExportSymbolTF(symbol, tf, 0); // empty / corrupt
 
-   // Verify TTBR magic
-   if(existingBlob[0] != 'T' || existingBlob[1] != 'T' || existingBlob[2] != 'B' || existingBlob[3] != 'R')
-   {
-      return ExportSymbolTF(symbol, tf, 0); // corrupt, full re-export
-   }
+   // ── Step 2: find merge point using lastSyncTime (already in memory, no blob read) ──
+   // lastSyncTime == last bar's open time in seconds; blob stores ts as epoch milliseconds.
+   long lastExistingTsMs = (long)lastSyncTime * 1000;
 
-   // Unpack existing bar count
-   int existingCount = (int)existingBlob[4]
-                     | ((int)existingBlob[5] << 8)
-                     | ((int)existingBlob[6] << 16)
-                     | ((int)existingBlob[7] << 24);
+   int newStart = newCopied; // default: no bars found beyond existing (will be overridden below)
+   bool updatedLast = false;
 
-   // Find the timestamp of the last existing bar
-   if(existingCount <= 0 || ArraySize(existingBlob) < 8 + existingCount * 48)
-      return ExportSymbolTF(symbol, tf, 0); // corrupt
-
-   ByteConv bc;
-   int lastOff = 8 + (existingCount - 1) * 48;
-   ReadRaw8(existingBlob, lastOff, bc);
-   long lastExistingTsMs = bc.l;
-
-   // Find where new bars start (skip bars that overlap with existing data)
-   int newStart = 0;
    for(int i = 0; i < newCopied; i++)
    {
       long barTsMs = (long)newRates[i].time * 1000;
@@ -826,84 +886,92 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
          newStart = i;
          break;
       }
-      // Also update the last existing bar if timestamps match (bar may have updated)
       if(barTsMs == lastExistingTsMs)
       {
-         // Overwrite last bar in existing blob
-         int overOff = 8 + (existingCount - 1) * 48;
-         bc.l = barTsMs; WriteRaw8(existingBlob, overOff, bc);
-         bc.d = newRates[i].open; WriteRaw8(existingBlob, overOff + 8, bc);
-         bc.d = newRates[i].high; WriteRaw8(existingBlob, overOff + 16, bc);
-         bc.d = newRates[i].low; WriteRaw8(existingBlob, overOff + 24, bc);
-         bc.d = newRates[i].close; WriteRaw8(existingBlob, overOff + 32, bc);
-         bc.d = (double)newRates[i].tick_volume; WriteRaw8(existingBlob, overOff + 40, bc);
+         // This bar matches the existing last bar — it may have updated (close, high, low, volume)
+         updatedLast = true;
          newStart = i + 1;
+         // (no break: scan continues; subsequent bars with higher ts will set newStart further)
       }
    }
 
    int appendCount = newCopied - newStart;
-   if(appendCount <= 0)
+   long nowTs = (long)TimeCurrent();
+
+   // ── Step 3: apply delta via SQL BLOB UPDATE — zero large-blob MQL5 allocation ──
+
+   if(appendCount <= 0 && updatedLast)
    {
-      // No truly new bars — just update the last bar (close price may have changed)
-      // Write existing blob back (last bar was updated in-place above)
-      DatabaseReset(g_stmtBarInsert);
-      if(DatabaseBind(g_stmtBarInsert, 0, key) &&
-         DatabaseBindArray(g_stmtBarInsert, 1, existingBlob) &&
-         DatabaseBind(g_stmtBarInsert, 2, (long)TimeCurrent()) &&
-         DatabaseBind(g_stmtBarInsert, 3, (long)existingCount))
+      // Case 1: Only the forming bar's OHLCV changed — replace last 48 bytes in-place.
+      // Transfers exactly 48 bytes across MQL5/SQLite boundary regardless of blob size.
+      if(g_stmtUpdateLastBar == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0);
+      uchar lastBarBlob[48];
+      PackSingleBar(lastBarBlob, 0, newRates[newStart - 1]);
+      DatabaseReset(g_stmtUpdateLastBar);
+      if(!DatabaseBindArray(g_stmtUpdateLastBar, 0, lastBarBlob) ||
+         !DatabaseBind(g_stmtUpdateLastBar, 1, nowTs) ||
+         !DatabaseBind(g_stmtUpdateLastBar, 2, key))
       {
-         DatabaseRead(g_stmtBarInsert);
+         return 0;
       }
+      DatabaseRead(g_stmtUpdateLastBar);
       return existingCount;
    }
 
-   // Build merged blob: existing bars + new bars appended
+   if(appendCount <= 0)
+   {
+      // No new bars, last bar not matched (nothing to do this cycle)
+      return existingCount;
+   }
+
    int mergedCount = existingCount + appendCount;
-   int mergedBytes = 8 + mergedCount * 48;
-   uchar mergedBlob[];
-   ArrayResize(mergedBlob, mergedBytes);
+   uchar countLE4[];
+   EncodeLE4(mergedCount, countLE4);
 
-   // Copy existing header + bars
-   int existingBytes = 8 + existingCount * 48;
-   ArrayCopy(mergedBlob, existingBlob, 0, 0, existingBytes);
-
-   // Update count in header
-   mergedBlob[4] = (uchar)(mergedCount & 0xFF);
-   mergedBlob[5] = (uchar)((mergedCount >> 8) & 0xFF);
-   mergedBlob[6] = (uchar)((mergedCount >> 16) & 0xFF);
-   mergedBlob[7] = (uchar)((mergedCount >> 24) & 0xFF);
-
-   // Append new bars
-   for(int i = 0; i < appendCount; i++)
+   if(updatedLast && newStart > 0)
    {
-      int off = existingBytes + i * 48;
-      int ri = newStart + i;
-      bc.l = (long)newRates[ri].time * 1000;
-      WriteRaw8(mergedBlob, off, bc);
-      bc.d = newRates[ri].open;   WriteRaw8(mergedBlob, off + 8, bc);
-      bc.d = newRates[ri].high;   WriteRaw8(mergedBlob, off + 16, bc);
-      bc.d = newRates[ri].low;    WriteRaw8(mergedBlob, off + 24, bc);
-      bc.d = newRates[ri].close;  WriteRaw8(mergedBlob, off + 32, bc);
-      bc.d = (double)newRates[ri].tick_volume;
-      WriteRaw8(mergedBlob, off + 40, bc);
+      // Case 2: Replace last bar + append new bars.
+      // SQL: magic(4) || newCount(4) || allBarsExceptLast || updatedLastBar(48) || newBars
+      if(g_stmtReplaceLastAndAppend == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0);
+      uchar lastBarBlob[48];
+      PackSingleBar(lastBarBlob, 0, newRates[newStart - 1]);
+      uchar newBarsBlob[];
+      PackBarsBlob(newRates, newStart, appendCount, newBarsBlob);
+      DatabaseReset(g_stmtReplaceLastAndAppend);
+      if(!DatabaseBindArray(g_stmtReplaceLastAndAppend, 0, countLE4) ||
+         !DatabaseBindArray(g_stmtReplaceLastAndAppend, 1, lastBarBlob) ||
+         !DatabaseBindArray(g_stmtReplaceLastAndAppend, 2, newBarsBlob) ||
+         !DatabaseBind(g_stmtReplaceLastAndAppend, 3, (long)mergedCount) ||
+         !DatabaseBind(g_stmtReplaceLastAndAppend, 4, nowTs) ||
+         !DatabaseBind(g_stmtReplaceLastAndAppend, 5, key))
+      {
+         return 0;
+      }
+      DatabaseRead(g_stmtReplaceLastAndAppend);
    }
-
-   // Write merged blob to DB
-   DatabaseReset(g_stmtBarInsert);
-   if(!DatabaseBind(g_stmtBarInsert, 0, key) ||
-      !DatabaseBindArray(g_stmtBarInsert, 1, mergedBlob) ||
-      !DatabaseBind(g_stmtBarInsert, 2, (long)TimeCurrent()) ||
-      !DatabaseBind(g_stmtBarInsert, 3, (long)mergedCount))
+   else
    {
-      PrintFormat("  IncrementalExport bind failed: %s (err %d)", key, GetLastError());
-      return 0;
+      // Case 3: Append-only — new bars start past the existing last timestamp.
+      // SQL: magic(4) || newCount(4) || existingBars(unchanged) || newBars
+      if(g_stmtAppendOnly == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0);
+      uchar newBarsBlob[];
+      PackBarsBlob(newRates, newStart, appendCount, newBarsBlob);
+      DatabaseReset(g_stmtAppendOnly);
+      if(!DatabaseBindArray(g_stmtAppendOnly, 0, countLE4) ||
+         !DatabaseBindArray(g_stmtAppendOnly, 1, newBarsBlob) ||
+         !DatabaseBind(g_stmtAppendOnly, 2, (long)mergedCount) ||
+         !DatabaseBind(g_stmtAppendOnly, 3, nowTs) ||
+         !DatabaseBind(g_stmtAppendOnly, 4, key))
+      {
+         return 0;
+      }
+      DatabaseRead(g_stmtAppendOnly);
    }
-   DatabaseRead(g_stmtBarInsert);
 
    static int incrLogCount = 0;
    if(incrLogCount < 10)
    {
-      PrintFormat("  INCR OK: %s — +%d bars (total %d, %d bytes)", key, appendCount, mergedCount, mergedBytes);
+      PrintFormat("  INCR OK: %s — +%d bars (total %d, %d delta bytes)", key, appendCount, mergedCount, appendCount * 48 + 4);
       incrLogCount++;
    }
 
@@ -973,9 +1041,13 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   if(g_stmtBarInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtBarInsert); g_stmtBarInsert = INVALID_HANDLE; }
-   if(g_stmtTrackInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtTrackInsert); g_stmtTrackInsert = INVALID_HANDLE; }
-   if(g_stmtQuoteInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtQuoteInsert); g_stmtQuoteInsert = INVALID_HANDLE; }
+   if(g_stmtBarInsert != INVALID_HANDLE)             { DatabaseFinalize(g_stmtBarInsert);             g_stmtBarInsert = INVALID_HANDLE; }
+   if(g_stmtTrackInsert != INVALID_HANDLE)           { DatabaseFinalize(g_stmtTrackInsert);           g_stmtTrackInsert = INVALID_HANDLE; }
+   if(g_stmtQuoteInsert != INVALID_HANDLE)           { DatabaseFinalize(g_stmtQuoteInsert);           g_stmtQuoteInsert = INVALID_HANDLE; }
+   if(g_stmtBarCountRead != INVALID_HANDLE)          { DatabaseFinalize(g_stmtBarCountRead);          g_stmtBarCountRead = INVALID_HANDLE; }
+   if(g_stmtUpdateLastBar != INVALID_HANDLE)         { DatabaseFinalize(g_stmtUpdateLastBar);         g_stmtUpdateLastBar = INVALID_HANDLE; }
+   if(g_stmtReplaceLastAndAppend != INVALID_HANDLE)  { DatabaseFinalize(g_stmtReplaceLastAndAppend);  g_stmtReplaceLastAndAppend = INVALID_HANDLE; }
+   if(g_stmtAppendOnly != INVALID_HANDLE)            { DatabaseFinalize(g_stmtAppendOnly);            g_stmtAppendOnly = INVALID_HANDLE; }
    if(g_db != INVALID_HANDLE)
    {
       DatabaseClose(g_db);
