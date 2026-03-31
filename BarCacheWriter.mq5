@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.427"
+#property version   "1.428"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.428: CAST(?N AS BLOB) in SQL UPDATEs — MQL5 DatabaseBindArray may bind uchar[] as TEXT."
 #property description "v1.427: SQL BLOB append — no full blob round-trip. Only delta bytes cross MQL5/SQLite boundary."
 #property description "v1.426: Incremental sync — dynamic fetch (elapsed/period+2), append only new bars."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
@@ -422,8 +423,11 @@ int OnInit()
    // Used every cycle for each active symbol/TF to refresh the forming bar's close.
    // SQLite reads LENGTH() from the page header and writes only the changed tail bytes —
    // the rest of the blob is unmodified. Zero MQL5 memory for the existing bars.
+   // CAST(?N AS BLOB) on every bound parameter: MQL5's DatabaseBindArray may bind
+   // uchar[] as TEXT type. SQLite's || operator returns TEXT if either operand is TEXT,
+   // corrupting binary BLOB data. CAST forces BLOB type regardless of binding affinity.
    g_stmtUpdateLastBar = DatabasePrepare(g_db,
-      "UPDATE bar_cache SET data = SUBSTR(data,1,LENGTH(data)-48)||?1, timestamp=?2 WHERE key=?3");
+      "UPDATE bar_cache SET data=SUBSTR(data,1,LENGTH(data)-48)||CAST(?1 AS BLOB),timestamp=?2 WHERE key=?3");
    if(g_stmtUpdateLastBar == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare update-last-bar stmt (err %d)", GetLastError());
 
@@ -431,14 +435,14 @@ int OnInit()
    // Params: ?1=4-byte LE count, ?2=48-byte updated last bar, ?3=new bars blob, ?4=new count, ?5=ts, ?6=key
    // SUBSTR breakdown: magic(4) || newCount(4) || allBarsExceptLast || newLastBar || newBars
    g_stmtReplaceLastAndAppend = DatabasePrepare(g_db,
-      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||?1||SUBSTR(data,9,LENGTH(data)-56)||?2||?3, bar_count=?4, timestamp=?5 WHERE key=?6");
+      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||CAST(?1 AS BLOB)||SUBSTR(data,9,LENGTH(data)-56)||CAST(?2 AS BLOB)||CAST(?3 AS BLOB),bar_count=?4,timestamp=?5 WHERE key=?6");
    if(g_stmtReplaceLastAndAppend == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare replace-last-and-append stmt (err %d)", GetLastError());
 
    // Append new bars only (no last-bar update — timestamps in new batch start past existing last).
    // Params: ?1=4-byte LE count, ?2=new bars blob, ?3=new count, ?4=ts, ?5=key
    g_stmtAppendOnly = DatabasePrepare(g_db,
-      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||?1||SUBSTR(data,9)||?2, bar_count=?3, timestamp=?4 WHERE key=?5");
+      "UPDATE bar_cache SET data=SUBSTR(data,1,4)||CAST(?1 AS BLOB)||SUBSTR(data,9)||CAST(?2 AS BLOB),bar_count=?3,timestamp=?4 WHERE key=?5");
    if(g_stmtAppendOnly == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare append-only stmt (err %d)", GetLastError());
 
@@ -471,7 +475,7 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.427: %s symbols(%d), %ds interval, batch=%d, %d cached keys, SQL BLOB append, forex=%s",
+   PrintFormat("BarCacheWriter v1.428: %s symbols(%d), %ds interval, batch=%d, %d cached keys, SQL BLOB append, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
