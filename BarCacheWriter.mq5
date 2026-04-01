@@ -23,11 +23,11 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.428"
+#property version   "1.429"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.429: Resource management — page_size 4096, periodic checkpoint, batch sleep, bar cap."
 #property description "v1.428: CAST(?N AS BLOB) in SQL UPDATEs — MQL5 DatabaseBindArray may bind uchar[] as TEXT."
 #property description "v1.427: SQL BLOB append — no full blob round-trip. Only delta bytes cross MQL5/SQLite boundary."
-#property description "v1.426: Incremental sync — dynamic fetch (elapsed/period+2), append only new bars."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
@@ -65,6 +65,8 @@ int g_trackCount = 0;
 bool g_trackSorted = true; // false when new keys appended, triggers re-sort
 #define MAX_CONSEC_FAILS 10  // Give up on a symbol/TF after this many consecutive failures
 #define FAIL_SENTINEL  1     // Sentinel timestamp: marks "permanently failed, stop retrying"
+#define MAX_BARS_PER_KEY 100000  // Hard cap: trim oldest bars during incremental merge if exceeded
+int g_cycleCount = 0;           // Counts ExportAll() calls for periodic maintenance
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
@@ -390,11 +392,15 @@ int OnInit()
    // without scanning through multi-MB blob rows. Drops metadata queries from ~12s to <100ms.
    DatabaseExecute(g_db, "CREATE INDEX IF NOT EXISTS idx_bar_meta ON bar_cache(key, timestamp, bar_count)");
 
-   // Use DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary
+   // Use DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary.
+   // page_size=4096: default but explicit — matches OS page size for aligned I/O.
+   // cache_size=-4000: 4MB page cache (reduced from 8MB — less Wine memory pressure).
+   // busy_timeout=5000: retry for 5s on lock instead of failing immediately.
    DatabaseExecute(g_db, "PRAGMA journal_mode=DELETE");
    DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
-   DatabaseExecute(g_db, "PRAGMA cache_size=-8000"); // 8MB page cache
-   DatabaseExecute(g_db, "PRAGMA busy_timeout=5000"); // Wait up to 5s for lock instead of failing
+   DatabaseExecute(g_db, "PRAGMA page_size=4096");
+   DatabaseExecute(g_db, "PRAGMA cache_size=-4000");
+   DatabaseExecute(g_db, "PRAGMA busy_timeout=5000");
 
    // Pre-prepare statements — avoids re-parsing SQL on every write (851 symbols × 9 TFs per tick)
    g_stmtBarInsert = DatabasePrepare(g_db,
@@ -475,7 +481,7 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.428: %s symbols(%d), %ds interval, batch=%d, %d cached keys, SQL BLOB append, forex=%s",
+   PrintFormat("BarCacheWriter v1.429: %s symbols(%d), %ds interval, batch=%d, %d cached keys, SQL BLOB append, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
@@ -488,6 +494,17 @@ void OnTimer() { ExportAll(); }
 void ExportAll()
 {
    if(g_db == INVALID_HANDLE) return;
+
+   g_cycleCount++;
+
+   // Periodic maintenance: every 60 cycles (~30 minutes at 30s interval).
+   // PRAGMA incremental_vacuum reclaims freed pages from DELETE mode fragmentation.
+   // Without this, the DB file grows monotonically as SQLite reuses freed pages
+   // only within the same session — Wine memory maps grow proportionally.
+   if(g_cycleCount % 60 == 0)
+   {
+      DatabaseExecute(g_db, "PRAGMA incremental_vacuum(100)"); // reclaim up to 100 pages per run
+   }
 
    uint tickStart = GetTickCount();
    int symCount = SymbolsTotal(MarketWatchOnly);
@@ -649,6 +666,11 @@ void ExportAll()
       {
          SafeCommit();
          inTxn = false;
+         // Yield CPU between batches — prevents Wine from monopolizing resources.
+         // 50ms sleep × (symCount/BatchSize) batches = ~2s total for 851 symbols.
+         // Without this, the tight loop starves other Wine processes and the
+         // SQLite page cache never gets a chance to flush to disk.
+         Sleep(50);
       }
    }
 
@@ -929,6 +951,35 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    }
 
    int mergedCount = existingCount + appendCount;
+
+   // Cap total bars per key — prevents blobs from growing without bound.
+   // If we'd exceed MAX_BARS_PER_KEY, SQLite trims oldest bars server-side via SUBSTR.
+   // E.g., 100K existing + 5 new = 100005 → trim 5 oldest → 100000 total.
+   // The trim is implicit in the SUBSTR: we skip the first N*48 bytes of existing data.
+   int trimCount = 0;
+   if(mergedCount > MAX_BARS_PER_KEY)
+   {
+      trimCount = mergedCount - MAX_BARS_PER_KEY;
+      mergedCount = MAX_BARS_PER_KEY;
+   }
+
+   // If trimming needed, fall back to full re-export capped at MAX_BARS_PER_KEY.
+   // This only triggers once when a key first hits the cap. After that, each cycle
+   // adds 1-5 and would trim 1-5, keeping count at MAX_BARS_PER_KEY. But the trim
+   // requires dynamic SUBSTR offsets incompatible with pre-prepared statements, so
+   // a full export (which already caps at MaxBarsForTF = 100K) is simpler and correct.
+   if(trimCount > 0)
+   {
+      static int trimLogCount = 0;
+      if(trimLogCount < 5)
+      {
+         PrintFormat("  CAP: %s — %d+%d=%d exceeds %d, full re-export with cap",
+            key, existingCount, appendCount, existingCount + appendCount, MAX_BARS_PER_KEY);
+         trimLogCount++;
+      }
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY);
+   }
+
    uchar countLE4[];
    EncodeLE4(mergedCount, countLE4);
 
