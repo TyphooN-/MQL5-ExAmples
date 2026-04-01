@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.430"
+#property version   "1.431"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.431: Skip blob write when no new bars — 95% less I/O. Batch 10, sleep 100ms."
 #property description "v1.430: Revert SQL BLOB UPDATE (data corruption). Back to reliable in-memory merge."
-#property description "v1.429: Resource management — batch sleep, periodic vacuum, bar cap 100K."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
@@ -36,7 +36,7 @@
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
-input int    BatchSize         = 20;     // Symbols per SQLite transaction (batching reduces fsync overhead)
+input int    BatchSize         = 10;     // Symbols per SQLite transaction (smaller = shorter exclusive lock)
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 
 int g_db = INVALID_HANDLE;
@@ -411,7 +411,7 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.430: %s symbols(%d), %ds interval, batch=%d, %d cached keys, in-memory merge, forex=%s",
+   PrintFormat("BarCacheWriter v1.431: %s symbols(%d), %ds interval, batch=%d, %d cached keys, in-memory merge, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
@@ -596,11 +596,12 @@ void ExportAll()
       {
          SafeCommit();
          inTxn = false;
-         // Yield CPU between batches — prevents Wine from monopolizing resources.
-         // 50ms sleep × (symCount/BatchSize) batches = ~2s total for 851 symbols.
-         // Without this, the tight loop starves other Wine processes and the
-         // SQLite page cache never gets a chance to flush to disk.
-         Sleep(50);
+         // Yield CPU between batches — gives TyphooN-Terminal time to read between
+         // BarCacheWriter's exclusive-lock transactions (DELETE journal mode).
+         // 100ms sleep × (symCount/BatchSize) batches = ~8.5s total for 851 symbols.
+         // Well within the 30s update interval. Without this, back-to-back transactions
+         // keep the exclusive lock nearly continuously, blocking all readers.
+         Sleep(100);
       }
    }
 
@@ -875,13 +876,11 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    int appendCount = newCopied - newStart;
    if(appendCount <= 0)
    {
-      // No new bars — just write back (last bar may have been updated in-place)
-      DatabaseReset(g_stmtBarInsert);
-      if(DatabaseBind(g_stmtBarInsert, 0, key) &&
-         DatabaseBindArray(g_stmtBarInsert, 1, existingBlob) &&
-         DatabaseBind(g_stmtBarInsert, 2, (long)TimeCurrent()) &&
-         DatabaseBind(g_stmtBarInsert, 3, (long)existingCount))
-         DatabaseRead(g_stmtBarInsert);
+      // No new bars — skip the blob write entirely.
+      // The forming bar's close/high/low changes every tick but rewriting a 4.8MB
+      // blob for a 48-byte update is the #1 cause of Wine I/O contention.
+      // The forming bar will be captured when the NEXT bar opens (appendCount > 0).
+      // Bid/ask table already captures live prices for the watchlist.
       return existingCount;
    }
 
