@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.431"
+#property version   "1.432"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
-#property description "v1.431: Skip blob write when no new bars — 95% less I/O. Batch 10, sleep 100ms."
-#property description "v1.430: Revert SQL BLOB UPDATE (data corruption). Back to reliable in-memory merge."
+#property description "v1.432: TF gating — skip TFs that can't have new bars. Batch 5, sleep 200ms."
+#property description "v1.431: Skip blob write when no new bars — 95% less I/O."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
@@ -36,7 +36,7 @@
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
-input int    BatchSize         = 10;     // Symbols per SQLite transaction (smaller = shorter exclusive lock)
+input int    BatchSize         = 5;      // Symbols per SQLite transaction (smaller = shorter exclusive lock)
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 
 int g_db = INVALID_HANDLE;
@@ -58,6 +58,9 @@ bool g_trackSorted = true; // false when new keys appended, triggers re-sort
 #define FAIL_SENTINEL  1     // Sentinel timestamp: marks "permanently failed, stop retrying"
 #define MAX_BARS_PER_KEY 100000  // Hard cap: trim oldest bars during incremental merge if exceeded
 int g_cycleCount = 0;           // Counts ExportAll() calls for periodic maintenance
+// Per-TF last export time — skip TFs that can't have new bars since last check.
+// E.g., H4 bars only change every 4 hours, no point checking every 30 seconds.
+datetime g_tfLastExportTime[9]; // indexed by g_timeframes[] order
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
@@ -411,7 +414,9 @@ int OnInit()
    else
       LoadTrackingFromDB();
 
-   PrintFormat("BarCacheWriter v1.431: %s symbols(%d), %ds interval, batch=%d, %d cached keys, in-memory merge, forex=%s",
+   ArrayInitialize(g_tfLastExportTime, 0);
+
+   PrintFormat("BarCacheWriter v1.432: %s symbols(%d), %ds interval, batch=%d, %d cached keys, TF-gated merge, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
@@ -511,10 +516,27 @@ void ExportAll()
 
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
+         // TF gating: skip TFs that can't have new bars yet.
+         // If less than 80% of the TF period has elapsed since last export,
+         // a new bar can't have formed. 80% threshold allows for early checks
+         // near bar boundaries. This eliminates ~90% of CopyRates calls:
+         // at 30s intervals, only M1 is checked every cycle; M5 every ~4 min,
+         // H1 every ~48 min, D1 every ~19 hours, etc.
+         int tfPeriod = PeriodSeconds(g_timeframes[tf]);
+         datetime now = TimeCurrent();
+         if(g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
+         {
+            int elapsed = (int)(now - g_tfLastExportTime[tf]);
+            if(elapsed < (int)(tfPeriod * 0.8))
+            {
+               skipped++;
+               continue;
+            }
+         }
+
          string trackKey = symbol + ":" + g_tfStrings[tf];
          int idx = GetTrackIndex(trackKey);
 
-         // Single CopyRates call per symbol/TF — reuse for both change detection and tracking
          MqlRates lastRate[];
          int gotLast = CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate);
 
@@ -547,7 +569,8 @@ void ExportAll()
             {
                exported++;
                totalBars += bars;
-               g_trackFails[idx] = 0; // Reset on success
+               g_trackFails[idx] = 0;
+               g_tfLastExportTime[tf] = now;
                if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
@@ -583,6 +606,7 @@ void ExportAll()
          {
             exported++;
             totalBars += bars;
+            g_tfLastExportTime[tf] = now; // update TF gate timer
             if(gotLast == 1)
             {
                g_trackTimes[idx] = lastRate[0].time;
@@ -598,10 +622,9 @@ void ExportAll()
          inTxn = false;
          // Yield CPU between batches — gives TyphooN-Terminal time to read between
          // BarCacheWriter's exclusive-lock transactions (DELETE journal mode).
-         // 100ms sleep × (symCount/BatchSize) batches = ~8.5s total for 851 symbols.
-         // Well within the 30s update interval. Without this, back-to-back transactions
-         // keep the exclusive lock nearly continuously, blocking all readers.
-         Sleep(100);
+         // 200ms sleep × (symCount/BatchSize) batches. With TF gating, most cycles
+         // only process M1 bars so total time is much less than 30s interval.
+         Sleep(200);
       }
    }
 
