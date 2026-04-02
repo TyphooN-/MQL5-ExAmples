@@ -38,7 +38,6 @@ input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    BatchSize         = 10;     // Symbols per SQLite transaction
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
-input bool   UseRamdisk        = true;   // true = /dev/shm (zero disk I/O), false = MQL5/Files/
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -305,45 +304,10 @@ void LoadTrackingFromDB()
 
 int OnInit()
 {
-   if(UseRamdisk)
-   {
-      // Try multiple Wine-mapped paths to /dev/shm (tmpfs ramdisk).
-      // Wine maps Linux root to Z: drive. MQL5's DatabaseOpen may require
-      // different path formats depending on Wine/MQL5 version.
-      string ramdisk_paths[] = {
-         "Z:\\dev\\shm\\typhoon_mt5_cache.db",       // Wine Z: drive (backslash)
-         "Z:/dev/shm/typhoon_mt5_cache.db",          // Wine Z: drive (forward slash)
-      };
-      bool ramdisk_ok = false;
-      for(int i = 0; i < ArraySize(ramdisk_paths); i++)
-      {
-         // Try without COMMON flag first (some MQL5 builds support absolute paths)
-         g_db = DatabaseOpen(ramdisk_paths[i], DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
-         if(g_db != INVALID_HANDLE)
-         {
-            PrintFormat("BarCacheWriter: ramdisk OK at %s (zero disk I/O)", ramdisk_paths[i]);
-            ramdisk_ok = true;
-            break;
-         }
-         // Try with COMMON flag
-         g_db = DatabaseOpen(ramdisk_paths[i], DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE | DATABASE_OPEN_COMMON);
-         if(g_db != INVALID_HANDLE)
-         {
-            PrintFormat("BarCacheWriter: ramdisk OK (COMMON) at %s (zero disk I/O)", ramdisk_paths[i]);
-            ramdisk_ok = true;
-            break;
-         }
-      }
-      if(!ramdisk_ok)
-      {
-         PrintFormat("BarCacheWriter: ramdisk unavailable (error %d) — falling back to MQL5/Files/", GetLastError());
-         g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
-      }
-   }
-   else
-   {
-      g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
-   }
+   // Opens typhoon_mt5_cache.db in MQL5/Files/ sandbox.
+   // For ramdisk: use deploy_ramdisk.sh to symlink MQL5/Files/typhoon_mt5_cache.db → /dev/shm/
+   // This is transparent to MQL5 — zero code changes needed.
+   g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
    if(g_db == INVALID_HANDLE)
    {
       PrintFormat("BarCacheWriter: DB open failed (error %d)", GetLastError());
