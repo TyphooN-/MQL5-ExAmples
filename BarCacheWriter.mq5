@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.433"
+#property version   "1.434"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
-#property description "v1.433: EXCLUSIVE locking, 16MB cache, temp_store=MEMORY, journal_size_limit."
-#property description "v1.432: TF gating — skip TFs that can't have new bars. Batch 5, sleep 200ms."
+#property description "v1.434: Ramdisk support via /dev/shm symlink. Zero Wine I/O for all DB ops."
+#property description "v1.433: 16MB cache, temp_store=MEMORY, journal_size_limit."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
@@ -36,8 +36,9 @@
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
-input int    BatchSize         = 10;     // Symbols per SQLite transaction (EXCLUSIVE mode = no lock contention)
+input int    BatchSize         = 10;     // Symbols per SQLite transaction
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
+input bool   UseRamdisk        = true;   // true = /dev/shm (zero disk I/O), false = MQL5/Files/
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -304,7 +305,45 @@ void LoadTrackingFromDB()
 
 int OnInit()
 {
-   g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
+   if(UseRamdisk)
+   {
+      // Try multiple Wine-mapped paths to /dev/shm (tmpfs ramdisk).
+      // Wine maps Linux root to Z: drive. MQL5's DatabaseOpen may require
+      // different path formats depending on Wine/MQL5 version.
+      string ramdisk_paths[] = {
+         "Z:\\dev\\shm\\typhoon_mt5_cache.db",       // Wine Z: drive (backslash)
+         "Z:/dev/shm/typhoon_mt5_cache.db",          // Wine Z: drive (forward slash)
+      };
+      bool ramdisk_ok = false;
+      for(int i = 0; i < ArraySize(ramdisk_paths); i++)
+      {
+         // Try without COMMON flag first (some MQL5 builds support absolute paths)
+         g_db = DatabaseOpen(ramdisk_paths[i], DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
+         if(g_db != INVALID_HANDLE)
+         {
+            PrintFormat("BarCacheWriter: ramdisk OK at %s (zero disk I/O)", ramdisk_paths[i]);
+            ramdisk_ok = true;
+            break;
+         }
+         // Try with COMMON flag
+         g_db = DatabaseOpen(ramdisk_paths[i], DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE | DATABASE_OPEN_COMMON);
+         if(g_db != INVALID_HANDLE)
+         {
+            PrintFormat("BarCacheWriter: ramdisk OK (COMMON) at %s (zero disk I/O)", ramdisk_paths[i]);
+            ramdisk_ok = true;
+            break;
+         }
+      }
+      if(!ramdisk_ok)
+      {
+         PrintFormat("BarCacheWriter: ramdisk unavailable (error %d) — falling back to MQL5/Files/", GetLastError());
+         g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
+      }
+   }
+   else
+   {
+      g_db = DatabaseOpen("typhoon_mt5_cache.db", DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE);
+   }
    if(g_db == INVALID_HANDLE)
    {
       PrintFormat("BarCacheWriter: DB open failed (error %d)", GetLastError());
@@ -427,7 +466,7 @@ int OnInit()
 
    ArrayInitialize(g_tfLastExportTime, 0);
 
-   PrintFormat("BarCacheWriter v1.433: %s symbols(%d), %ds interval, batch=%d, %d cached keys, EXCLUSIVE+16MB cache, forex=%s",
+   PrintFormat("BarCacheWriter v1.434: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
