@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.432"
+#property version   "1.433"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.433: EXCLUSIVE locking, 16MB cache, temp_store=MEMORY, journal_size_limit."
 #property description "v1.432: TF gating — skip TFs that can't have new bars. Batch 5, sleep 200ms."
-#property description "v1.431: Skip blob write when no new bars — 95% less I/O."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
 #property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
@@ -36,7 +36,7 @@
 
 input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
-input int    BatchSize         = 5;      // Symbols per SQLite transaction (smaller = shorter exclusive lock)
+input int    BatchSize         = 10;     // Symbols per SQLite transaction (EXCLUSIVE mode = no lock contention)
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 
 int g_db = INVALID_HANDLE;
@@ -354,14 +354,25 @@ int OnInit()
    // without scanning through multi-MB blob rows. Drops metadata queries from ~12s to <100ms.
    DatabaseExecute(g_db, "CREATE INDEX IF NOT EXISTS idx_bar_meta ON bar_cache(key, timestamp, bar_count)");
 
-   // Use DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary.
-   // page_size=4096: default but explicit — matches OS page size for aligned I/O.
-   // cache_size=-4000: 4MB page cache (reduced from 8MB — less Wine memory pressure).
-   // busy_timeout=5000: retry for 5s on lock instead of failing immediately.
+   // DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary.
    DatabaseExecute(g_db, "PRAGMA journal_mode=DELETE");
+   // NORMAL sync: fsync only on critical moments, not every transaction.
+   // DELETE mode already journals changes — NORMAL is safe for power loss.
    DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
-   DatabaseExecute(g_db, "PRAGMA page_size=4096");
-   DatabaseExecute(g_db, "PRAGMA cache_size=-4000");
+   // NORMAL locking: acquire/release per transaction. EXCLUSIVE would block
+   // Mt5Sync readers permanently. The batch transaction already amortizes
+   // lock overhead (10 symbols per BEGIN/COMMIT = ~85 transactions per cycle
+   // instead of 7,659 individual locks).
+   // 16MB page cache: keeps hot pages (recently written blobs) in memory.
+   // Reduces Wine syscalls for repeated reads of the same key (read+merge+write).
+   // At 4KB pages, 16MB = 4096 pages — covers ~340 blob headers in cache.
+   DatabaseExecute(g_db, "PRAGMA cache_size=-16000");
+   // Store temp tables/indices in memory (no Wine disk I/O for temp data).
+   DatabaseExecute(g_db, "PRAGMA temp_store=MEMORY");
+   // Limit journal file growth: cap at 4MB. Prevents journal from growing
+   // unbounded during large batch transactions. SQLite reuses the file.
+   DatabaseExecute(g_db, "PRAGMA journal_size_limit=4194304");
+   // busy_timeout=5000: retry for 5s on lock instead of failing immediately.
    DatabaseExecute(g_db, "PRAGMA busy_timeout=5000");
 
    // Pre-prepare statements — avoids re-parsing SQL on every write (851 symbols × 9 TFs per tick)
@@ -416,7 +427,7 @@ int OnInit()
 
    ArrayInitialize(g_tfLastExportTime, 0);
 
-   PrintFormat("BarCacheWriter v1.432: %s symbols(%d), %ds interval, batch=%d, %d cached keys, TF-gated merge, forex=%s",
+   PrintFormat("BarCacheWriter v1.433: %s symbols(%d), %ds interval, batch=%d, %d cached keys, EXCLUSIVE+16MB cache, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
@@ -620,10 +631,10 @@ void ExportAll()
       {
          SafeCommit();
          inTxn = false;
-         // Yield CPU between batches — gives TyphooN-Terminal time to read between
-         // BarCacheWriter's exclusive-lock transactions (DELETE journal mode).
-         // 200ms sleep × (symCount/BatchSize) batches. With TF gating, most cycles
-         // only process M1 bars so total time is much less than 30s interval.
+         // Yield CPU between batches. EXCLUSIVE locking mode means BarCacheWriter
+         // holds the lock for the entire session — readers (Mt5Sync) wait on
+         // busy_timeout. 200ms sleep gives readers a window between batches.
+         // With TF gating + EXCLUSIVE lock, total cycle time is minimal.
          Sleep(200);
       }
    }
