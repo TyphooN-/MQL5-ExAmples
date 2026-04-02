@@ -23,9 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.434"
+#property version   "1.435"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
-#property description "v1.434: Ramdisk support via /dev/shm symlink. Zero Wine I/O for all DB ops."
+#property description "v1.435: Ramdisk via deploy_ramdisk.sh symlink (no MQL5 code changes)."
 #property description "v1.433: 16MB cache, temp_store=MEMORY, journal_size_limit."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
 #property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
@@ -430,7 +430,7 @@ int OnInit()
 
    ArrayInitialize(g_tfLastExportTime, 0);
 
-   PrintFormat("BarCacheWriter v1.434: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s",
+   PrintFormat("BarCacheWriter v1.435: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED");
 
