@@ -72,16 +72,15 @@ for name in $ACTIVE_INSTANCES; do
         continue
     fi
 
-    # Delete old on-disk DB (data will be re-exported by BarCacheWriter)
+    # Copy existing DB to ramdisk (preserves all historical data!)
+    # Previously this deleted the DB, causing data loss on first run.
     if [ -f "$db_path" ]; then
         size=$(du -h "$db_path" | cut -f1)
-        echo "  $name: deleting old DB ($size) — will re-export to ramdisk"
+        echo "  $name: copying existing DB ($size) to ramdisk — zero data loss"
+        cp "$db_path" "$ramdisk_db"
         rm "$db_path"
-    fi
-
-    # Clean any stale ramdisk DB from previous run
-    if [ -f "$ramdisk_db" ]; then
-        rm "$ramdisk_db"
+    elif [ -f "$ramdisk_db" ]; then
+        echo "  $name: ramdisk DB already exists ($(du -h "$ramdisk_db" | cut -f1))"
     fi
 
     # Create symlink: MQL5/Files/typhoon_mt5_cache.db → /dev/shm/typhoon_mt5_cache_.mt5_X.db

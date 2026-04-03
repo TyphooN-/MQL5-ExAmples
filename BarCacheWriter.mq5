@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.435"
+#property version   "1.436"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.436: Integrity check on startup — detects ramdisk data loss, auto re-exports."
 #property description "v1.435: Ramdisk via deploy_ramdisk.sh symlink (no MQL5 code changes)."
 #property description "v1.433: 16MB cache, temp_store=MEMORY, journal_size_limit."
 #property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
@@ -38,6 +39,7 @@ input int    UpdateIntervalSec = 30;     // Update interval (seconds)
 input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    BatchSize         = 10;     // Symbols per SQLite transaction
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
+input bool   IntegrityCheck    = true;   // Verify bar counts on startup, re-export short keys
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -141,6 +143,20 @@ string TFToStr(ENUM_TIMEFRAMES tf)
       case PERIOD_MN1: return "1Month";
    }
    return "?";
+}
+
+ENUM_TIMEFRAMES StrToTF(string s)
+{
+   if(s == "1Min")   return PERIOD_M1;
+   if(s == "5Min")   return PERIOD_M5;
+   if(s == "15Min")  return PERIOD_M15;
+   if(s == "30Min")  return PERIOD_M30;
+   if(s == "1Hour")  return PERIOD_H1;
+   if(s == "4Hour")  return PERIOD_H4;
+   if(s == "1Day")   return PERIOD_D1;
+   if(s == "1Week")  return PERIOD_W1;
+   if(s == "1Month") return PERIOD_MN1;
+   return (ENUM_TIMEFRAMES)0;
 }
 
 // Binary search for key in sorted g_trackKeys. Returns index or -1.
@@ -430,9 +446,80 @@ int OnInit()
 
    ArrayInitialize(g_tfLastExportTime, 0);
 
-   PrintFormat("BarCacheWriter v1.435: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s",
+   // Integrity check: compare DB bar counts vs MT5 available bars.
+   // Detects data loss from ramdisk migration (empty /dev/shm DB) or interrupted exports.
+   // Re-exports any symbol:TF where DB has <50% of MT5's available bars.
+   if(IntegrityCheck && !ForceReExport)
+   {
+      int checkedCount = 0, reExportCount = 0;
+      uint intStart = GetTickCount();
+
+      // Check a representative sample: all TFs for symbols with tracking
+      for(int i = 0; i < g_trackCount && i < 2000; i++)
+      {
+         string tKey = g_trackKeys[i];
+         // Parse "SYMBOL:TF" from tracking key
+         int colonPos = StringFind(tKey, ":");
+         if(colonPos <= 0) continue;
+         string sym = StringSubstr(tKey, 0, colonPos);
+         string tfStr = StringSubstr(tKey, colonPos + 1);
+
+         // Get DB bar count from bar_cache
+         string cacheKey = "mt5:" + sym + ":" + tfStr;
+         int dbCount = 0;
+         if(g_stmtBarRead != INVALID_HANDLE)
+         {
+            DatabaseReset(g_stmtBarRead);
+            DatabaseBind(g_stmtBarRead, 0, cacheKey);
+            if(DatabaseRead(g_stmtBarRead))
+            {
+               uchar tmpBlob[];
+               DatabaseColumnBlob(g_stmtBarRead, 0, tmpBlob);
+               if(ArraySize(tmpBlob) >= 8 && tmpBlob[0] == 'T' && tmpBlob[1] == 'T')
+               {
+                  dbCount = (int)tmpBlob[4]
+                          | ((int)tmpBlob[5] << 8)
+                          | ((int)tmpBlob[6] << 16)
+                          | ((int)tmpBlob[7] << 24);
+               }
+            }
+         }
+
+         // Get MT5 available bar count
+         ENUM_TIMEFRAMES enumTf = StrToTF(tfStr);
+         if(enumTf == 0) continue;
+         int mt5Count = Bars(sym, enumTf);
+         checkedCount++;
+
+         // Re-export if DB has <50% of MT5's available bars (significant data loss)
+         if(mt5Count > 100 && dbCount < mt5Count / 2)
+         {
+            SymbolSelect(sym, true);
+            int bars = ExportSymbolTF(sym, enumTf, MaxBarsForTF(enumTf));
+            if(bars > 0)
+            {
+               reExportCount++;
+               PrintFormat("  Integrity fix: %s — DB had %d bars, MT5 has %d, re-exported %d",
+                  cacheKey, dbCount, mt5Count, bars);
+               // Update tracking
+               MqlRates lastRate[];
+               if(CopyRates(sym, enumTf, 0, 1, lastRate) == 1)
+               {
+                  g_trackTimes[i] = lastRate[0].time;
+                  SaveTrackTime(tKey, lastRate[0].time);
+               }
+            }
+         }
+      }
+      uint intElapsed = GetTickCount() - intStart;
+      PrintFormat("BarCacheWriter: integrity check — %d keys checked, %d re-exported (%d ms)",
+         checkedCount, reExportCount, intElapsed);
+   }
+
+   PrintFormat("BarCacheWriter v1.436: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
-      g_isCFDServer ? "ENABLED" : "SKIPPED");
+      g_isCFDServer ? "ENABLED" : "SKIPPED",
+      IntegrityCheck ? "ON" : "OFF");
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
@@ -650,6 +737,67 @@ void ExportAll()
       SortTrackArrays();
 
    // Count TF slots still pending (never successfully exported, excluding permanently failed)
+   // Per-cycle integrity spot check: verify a few recently-exported keys have correct bar counts.
+   // Catches silent data loss from ramdisk issues without the cost of a full scan.
+   if(IntegrityCheck && exported > 0 && g_cycleCount % 10 == 0)
+   {
+      int spotChecked = 0, spotFixed = 0;
+      for(int sc = 0; sc < g_trackCount && spotChecked < 20; sc++)
+      {
+         // Pick evenly-spaced keys to cover the full range
+         int idx2 = (g_cycleCount * 17 + sc * 137) % g_trackCount;  // pseudo-random spread
+         if(g_trackTimes[idx2] == 0 || g_trackTimes[idx2] == (datetime)FAIL_SENTINEL) continue;
+         string tKey = g_trackKeys[idx2];
+         int colonPos2 = StringFind(tKey, ":");
+         if(colonPos2 <= 0) continue;
+         string sym2 = StringSubstr(tKey, 0, colonPos2);
+         string tfStr2 = StringSubstr(tKey, colonPos2 + 1);
+         ENUM_TIMEFRAMES enumTf2 = StrToTF(tfStr2);
+         if(enumTf2 == 0) continue;
+
+         string cacheKey2 = "mt5:" + sym2 + ":" + tfStr2;
+         int dbCount2 = 0;
+         if(g_stmtBarRead != INVALID_HANDLE)
+         {
+            DatabaseReset(g_stmtBarRead);
+            DatabaseBind(g_stmtBarRead, 0, cacheKey2);
+            if(DatabaseRead(g_stmtBarRead))
+            {
+               uchar tmpBlob2[];
+               DatabaseColumnBlob(g_stmtBarRead, 0, tmpBlob2);
+               if(ArraySize(tmpBlob2) >= 8 && tmpBlob2[0] == 'T' && tmpBlob2[1] == 'T')
+                  dbCount2 = (int)tmpBlob2[4] | ((int)tmpBlob2[5] << 8) | ((int)tmpBlob2[6] << 16) | ((int)tmpBlob2[7] << 24);
+            }
+         }
+         int mt5Count2 = Bars(sym2, enumTf2);
+         spotChecked++;
+
+         if(mt5Count2 > 100 && dbCount2 < mt5Count2 / 2)
+         {
+            SymbolSelect(sym2, true);
+            SafeBegin();
+            int bars2 = ExportSymbolTF(sym2, enumTf2, MaxBarsForTF(enumTf2));
+            SafeCommit();
+            if(bars2 > 0)
+            {
+               spotFixed++;
+               PrintFormat("  Integrity spot-fix: %s — DB %d bars, MT5 %d, wrote %d",
+                  cacheKey2, dbCount2, mt5Count2, bars2);
+            }
+         }
+      }
+      if(spotFixed > 0)
+         PrintFormat("BarCacheWriter: spot check fixed %d/%d keys", spotFixed, spotChecked);
+   }
+
+   // Periodic compact: VACUUM every ~2 hours to reclaim /dev/shm space
+   if(g_cycleCount % 240 == 0 && g_cycleCount > 0)
+   {
+      uint vacStart = GetTickCount();
+      DatabaseExecute(g_db, "VACUUM");
+      PrintFormat("BarCacheWriter: VACUUM completed (%d ms)", GetTickCount() - vacStart);
+   }
+
    int pendingSlots = 0;
    int failedSlots = 0;
    for(int i = 0; i < g_trackCount; i++)
