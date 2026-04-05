@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.436"
+#property version   "1.437"
 #property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
+#property description "v1.437: Batched integrity check — commits every 20 symbols to prevent OOM. demand.txt support."
 #property description "v1.436: Integrity check on startup — detects ramdisk data loss, auto re-exports."
 #property description "v1.435: Ramdisk via deploy_ramdisk.sh symlink (no MQL5 code changes)."
 #property description "v1.433: 16MB cache, temp_store=MEMORY, journal_size_limit."
@@ -449,18 +450,71 @@ int OnInit()
    // Startup integrity check: compare DB bar counts vs MT5 available bars for ALL symbols.
    // Runs once on startup — detects data loss from ramdisk migration or interrupted exports.
    // Re-exports any symbol:TF where DB has <50% of MT5's available bars.
+   // v1.437: Batched to prevent OOM on large symbol counts after reboot.
+   //         Commits every INTEGRITY_BATCH_SIZE symbols to release memory.
+   //         Limits bars per integrity fix to 10K (full history fills in via normal 30s cycle).
+   //         Reads demand.txt if present — prioritizes symbols TyphooN-Terminal actually needs.
    if(IntegrityCheck && !ForceReExport)
    {
       int checkedCount = 0, reExportCount = 0, totalReExportedBars = 0;
       uint intStart = GetTickCount();
       int symCount = SymbolsTotal(MarketWatchOnly);
+      #define INTEGRITY_BATCH_SIZE 20  // Commit every N symbols to release memory
+      #define INTEGRITY_BAR_CAP 10000  // Cap bars during integrity (full history via normal cycle)
 
+      // Read demand list from TyphooN-Terminal (if present)
+      // Format: one symbol per line in ~/.typhoon/cache/demand.txt
+      string demandSymbols[];
+      int demandCount = 0;
+      string demandPath = "";
+      // Try common locations for the demand file
+      string homePaths[];
+      int homeCount = 0;
+      // On Linux/Wine: Z:\home\user\.typhoon\cache\demand.txt
+      string homeEnv = "";
+      // MQL5 can't read env vars easily — use a fixed known path convention
+      // The deploy.sh script or terminal writes demand.txt next to the DB
+      // Try the same directory as the SQLite database
+      string demandFile = g_accountTag + "_demand.txt";
+      // Check if demand file exists in the same dir as the database
+      int demandHandle = FileOpen(demandFile, FILE_READ | FILE_ANSI | FILE_COMMON);
+      if(demandHandle != INVALID_HANDLE)
+      {
+         while(!FileIsEnding(demandHandle))
+         {
+            string line = FileReadString(demandHandle);
+            StringTrimRight(line);
+            StringTrimLeft(line);
+            if(StringLen(line) > 0)
+            {
+               ArrayResize(demandSymbols, demandCount + 1);
+               demandSymbols[demandCount] = line;
+               demandCount++;
+            }
+         }
+         FileClose(demandHandle);
+         PrintFormat("BarCacheWriter: demand.txt loaded — %d priority symbols", demandCount);
+      }
+
+      int batchCount = 0;
       SafeBegin();
       for(int si = 0; si < symCount; si++)
       {
          string sym = SymbolName(si, MarketWatchOnly);
          if(StringLen(sym) == 0) continue;
          if(!g_isCFDServer && IsForexSymbol(sym)) continue;
+
+         // If demand list exists and this symbol isn't in it, defer to normal cycle
+         if(demandCount > 0)
+         {
+            bool inDemand = false;
+            for(int di = 0; di < demandCount; di++)
+            {
+               if(demandSymbols[di] == sym) { inDemand = true; break; }
+            }
+            if(!inDemand) continue;
+         }
+
          SymbolSelect(sym, true);
 
          for(int ti = 0; ti < ArraySize(g_timeframes); ti++)
@@ -489,7 +543,9 @@ int OnInit()
             // Re-export if DB has <50% of MT5's available bars
             if(dbCount < mt5Count / 2)
             {
-               int bars = ExportSymbolTF(sym, enumTf, MaxBarsForTF(enumTf));
+               // Cap bars during integrity to prevent OOM — full history fills via normal 30s cycle
+               int maxBars = MathMin(MaxBarsForTF(enumTf), INTEGRITY_BAR_CAP);
+               int bars = ExportSymbolTF(sym, enumTf, maxBars);
                if(bars > 0)
                {
                   reExportCount++;
@@ -504,16 +560,24 @@ int OnInit()
                      SaveTrackTime(trackKey, lastRate[0].time);
                   }
                   if(reExportCount <= 50) // limit log spam
-                     PrintFormat("  Integrity fix: %s — DB %d bars, MT5 %d, exported %d",
-                        cacheKey, dbCount, mt5Count, bars);
+                     PrintFormat("  Integrity fix: %s — DB %d bars, MT5 %d, exported %d (cap %d)",
+                        cacheKey, dbCount, mt5Count, bars, maxBars);
                }
             }
+         }
+
+         // Batch commit every INTEGRITY_BATCH_SIZE symbols to release memory
+         batchCount++;
+         if(batchCount % INTEGRITY_BATCH_SIZE == 0)
+         {
+            SafeCommit();
+            SafeBegin();
          }
       }
       SafeCommit();
       uint intElapsed = GetTickCount() - intStart;
-      PrintFormat("BarCacheWriter: startup integrity — %d keys checked, %d re-exported (%d bars) in %d ms",
-         checkedCount, reExportCount, totalReExportedBars, intElapsed);
+      PrintFormat("BarCacheWriter: startup integrity — %d keys checked, %d re-exported (%d bars) in %d ms, demand=%d",
+         checkedCount, reExportCount, totalReExportedBars, intElapsed, demandCount);
    }
 
    PrintFormat("BarCacheWriter v1.436: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
