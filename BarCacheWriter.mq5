@@ -576,7 +576,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.436: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
+   PrintFormat("BarCacheWriter v1.437: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF");
