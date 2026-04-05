@@ -24,15 +24,9 @@
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.437"
-#property description "Writes bar data (TTBR binary) + symbol specs + live bid/ask to SQLite."
-#property description "v1.437: Batched integrity check — commits every 20 symbols to prevent OOM. demand.txt support."
-#property description "v1.436: Integrity check on startup — detects ramdisk data loss, auto re-exports."
-#property description "v1.435: Ramdisk via deploy_ramdisk.sh symlink (no MQL5 code changes)."
-#property description "v1.433: 16MB cache, temp_store=MEMORY, journal_size_limit."
-#property description "v1.424: Cap all timeframes at 100K bars. Forex filtering by server type."
-#property description "v1.422: Forex filtering — only export forex on CFD server (detected by USDMXN)."
-#property description "v1.418: Live bid/ask sync for all symbols every tick (INSERT OR REPLACE, flat table)."
-#property description "v1.414: Full history export (MaxBarsForTF) on every sync — no truncation."
+#property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.437: Batched integrity, demand.txt, OOM fix."
+#property description "v1.436: Integrity check, ramdisk, 16MB cache."
 #property strict
 
 
@@ -466,12 +460,6 @@ int OnInit()
       // Format: one symbol per line in ~/.typhoon/cache/demand.txt
       string demandSymbols[];
       int demandCount = 0;
-      string demandPath = "";
-      // Try common locations for the demand file
-      string homePaths[];
-      int homeCount = 0;
-      // On Linux/Wine: Z:\home\user\.typhoon\cache\demand.txt
-      string homeEnv = "";
       // MQL5 can't read env vars easily — use a fixed known path convention
       // The deploy.sh script or terminal writes demand.txt next to the DB
       // Try the same directory as the SQLite database
