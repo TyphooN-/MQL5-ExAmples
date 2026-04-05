@@ -476,8 +476,16 @@ int OnInit()
       // The deploy.sh script or terminal writes demand.txt next to the DB
       // Try the same directory as the SQLite database
       string demandFile = g_accountTag + "_demand.txt";
-      // Check if demand file exists in the same dir as the database
+      // Check demand.txt: first try next to the database, then MQL5 common files
+      // After reboot, the copy next to the DB (on /dev/shm) is gone, but
+      // TyphooN-Terminal also writes persistent copies to ~/.typhoon/cache/
+      // The deploy.sh script can symlink or copy from there.
       int demandHandle = FileOpen(demandFile, FILE_READ | FILE_ANSI | FILE_COMMON);
+      if(demandHandle == INVALID_HANDLE)
+      {
+         // Try without account tag (generic demand.txt)
+         demandHandle = FileOpen("demand.txt", FILE_READ | FILE_ANSI | FILE_COMMON);
+      }
       if(demandHandle != INVALID_HANDLE)
       {
          while(!FileIsEnding(demandHandle))
