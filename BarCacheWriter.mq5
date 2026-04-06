@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.437"
+#property version   "1.438"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.438: CPU optimization — rotating symbol batches, halved bid/ask freq."
 #property description "v1.437: Batched integrity, demand.txt, OOM fix."
-#property description "v1.436: Integrity check, ramdisk, 16MB cache."
 #property strict
 
 
@@ -457,23 +457,19 @@ int OnInit()
       #define INTEGRITY_BAR_CAP 10000  // Cap bars during integrity (full history via normal cycle)
 
       // Read demand list from TyphooN-Terminal (if present)
-      // Format: one symbol per line in ~/.typhoon/cache/demand.txt
-      string demandSymbols[];
+      // demand.txt v2: SYMBOL:TF:LAST_TS format (lines starting with # are comments)
+      // v1 compat: plain symbol names (no colons) are treated as "all TFs, full export"
+      string demandSymbols[];    // flat symbol list (v1 compat)
       int demandCount = 0;
-      // MQL5 can't read env vars easily — use a fixed known path convention
-      // The deploy.sh script or terminal writes demand.txt next to the DB
-      // Try the same directory as the SQLite database
+      // v2: per-symbol:TF last timestamp — only export bars AFTER this time
+      string demandKeys[];       // "EURUSD:1Hour"
+      datetime demandTimestamps[];  // last known timestamp
+      int demandV2Count = 0;
+
       string demandFile = g_accountTag + "_demand.txt";
-      // Check demand.txt: first try next to the database, then MQL5 common files
-      // After reboot, the copy next to the DB (on /dev/shm) is gone, but
-      // TyphooN-Terminal also writes persistent copies to ~/.typhoon/cache/
-      // The deploy.sh script can symlink or copy from there.
       int demandHandle = FileOpen(demandFile, FILE_READ | FILE_ANSI | FILE_COMMON);
       if(demandHandle == INVALID_HANDLE)
-      {
-         // Try without account tag (generic demand.txt)
          demandHandle = FileOpen("demand.txt", FILE_READ | FILE_ANSI | FILE_COMMON);
-      }
       if(demandHandle != INVALID_HANDLE)
       {
          while(!FileIsEnding(demandHandle))
@@ -481,15 +477,42 @@ int OnInit()
             string line = FileReadString(demandHandle);
             StringTrimRight(line);
             StringTrimLeft(line);
-            if(StringLen(line) > 0)
+            if(StringLen(line) == 0 || StringGetCharacter(line, 0) == '#') continue; // skip empty/comments
+
+            // v2 format: SYMBOL:TF:TIMESTAMP (3 colons)
+            string parts[];
+            int nParts = StringSplit(line, ':', parts);
+            if(nParts == 3)
             {
+               // v2 entry: EURUSD:1Hour:1743897600000
+               string symTf = parts[0] + ":" + parts[1];
+               long tsMs = StringToInteger(parts[2]);
+               datetime ts = (datetime)(tsMs / 1000);
+               ArrayResize(demandKeys, demandV2Count + 1);
+               ArrayResize(demandTimestamps, demandV2Count + 1);
+               demandKeys[demandV2Count] = symTf;
+               demandTimestamps[demandV2Count] = ts;
+               demandV2Count++;
+               // Also add symbol to flat list for v1 compat matching
+               bool symFound = false;
+               for(int di = 0; di < demandCount; di++)
+                  if(demandSymbols[di] == parts[0]) { symFound = true; break; }
+               if(!symFound) {
+                  ArrayResize(demandSymbols, demandCount + 1);
+                  demandSymbols[demandCount] = parts[0];
+                  demandCount++;
+               }
+            }
+            else if(nParts == 1)
+            {
+               // v1 format: plain symbol name
                ArrayResize(demandSymbols, demandCount + 1);
                demandSymbols[demandCount] = line;
                demandCount++;
             }
          }
          FileClose(demandHandle);
-         PrintFormat("BarCacheWriter: demand.txt loaded — %d priority symbols", demandCount);
+         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d v2 entries", demandCount, demandV2Count);
       }
 
       int batchCount = 0;
@@ -576,7 +599,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.437: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
+   PrintFormat("BarCacheWriter v1.438: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF");
@@ -628,8 +651,11 @@ void ExportAll()
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
 
-   // Live bid/ask sync — all symbols, every tick, flat table (895 rows max)
-   if(g_stmtQuoteInsert != INVALID_HANDLE)
+   // Live bid/ask sync — every OTHER cycle (60s instead of 30s) to reduce CPU
+   // v1.438: halved bid/ask frequency — 30s is overkill for most trading
+   static int quoteSkip = 0;
+   quoteSkip++;
+   if(g_stmtQuoteInsert != INVALID_HANDLE && quoteSkip % 2 == 0)
    {
       SafeBegin();
       long now = (long)TimeCurrent();
@@ -640,7 +666,7 @@ void ExportAll()
          if(StringLen(qSym) == 0) continue;
          double bid = SymbolInfoDouble(qSym, SYMBOL_BID);
          double ask = SymbolInfoDouble(qSym, SYMBOL_ASK);
-         if(bid <= 0 && ask <= 0) continue; // no quote data
+         if(bid <= 0 && ask <= 0) continue;
          double spread = (ask > 0 && bid > 0) ? (ask - bid) : 0;
          DatabaseReset(g_stmtQuoteInsert);
          DatabaseBind(g_stmtQuoteInsert, 0, qSym);
@@ -656,15 +682,27 @@ void ExportAll()
    int batchCount = 0;  // symbols in current transaction batch
    bool inTxn = false;
 
+   // v1.438 CPU optimization: process symbols in rotating batches instead of all 851 every cycle.
+   // Each cycle processes BatchSize*10 symbols (default 100). Full rotation in ~8 cycles (~4 min).
+   // Demand symbols (from TyphooN-Terminal) are ALWAYS processed every cycle for low latency.
+   static int rotationOffset = 0;
+   int symbolsPerCycle = BatchSize * 10; // default 100 symbols per 30s cycle
+
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
 
-      // Skip forex symbols on non-CFD servers (crypto/futures don't need EURUSD etc.)
+      // Skip forex symbols on non-CFD servers
       if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
-      // Select once per symbol — covers all TFs (was duplicated inside ExportSymbolTF)
+      // Rotation: skip symbols outside current batch window UNLESS they're in demand list
+      bool isDemand = false;
+      for(int di = 0; di < demandCount; di++)
+         if(demandSymbols[di] == symbol) { isDemand = true; break; }
+      if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
+         continue;
+
       SymbolSelect(symbol, true);
 
       // Batched transactions — group BatchSize symbols per BEGIN/COMMIT to reduce fsync overhead
@@ -818,11 +856,16 @@ void ExportAll()
    if(exported == 0 && skipped == 0) failCount++;
    else failCount = 0;
 
+   // Advance rotation for next cycle
+   rotationOffset += symbolsPerCycle;
+   if(rotationOffset >= symCount) rotationOffset = 0;
+
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
       uint elapsed = GetTickCount() - tickStart;
-      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending | %dms",
-         exported, skipped, totalBars, pendingSlots, elapsed);
+      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending | %dms (batch %d-%d of %d)",
+         exported, skipped, totalBars, pendingSlots, elapsed,
+         rotationOffset, MathMin(rotationOffset + symbolsPerCycle, symCount), symCount);
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
