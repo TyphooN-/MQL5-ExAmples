@@ -23,9 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.438"
+#property version   "1.439"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
-#property description "v1.438: CPU optimization — rotating symbol batches, halved bid/ask freq."
+#property description "v1.439: Perf — sorted demand lookup, linear CSV build, specs caching, pre-prepared metadata stmts."
 #property description "v1.437: Batched integrity, demand.txt, OOM fix."
 #property strict
 
@@ -35,6 +35,7 @@ input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    BatchSize         = 10;     // Symbols per SQLite transaction
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 input bool   IntegrityCheck    = true;   // Verify bar counts on startup, re-export short keys
+input int    SpecsCacheMin     = 60;    // Minutes between full symbol spec refreshes (default 1h)
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -42,6 +43,10 @@ int g_stmtBarInsert = INVALID_HANDLE;       // Pre-prepared INSERT OR REPLACE fo
 int g_stmtBarRead = INVALID_HANDLE;         // Pre-prepared SELECT data FROM bar_cache WHERE key=?1
 int g_stmtTrackInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bar_track
 int g_stmtQuoteInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bid_ask
+int g_stmtMetaInsert  = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for metadata (specs/symbols/server)
+bool g_demandSorted = false;                 // true after demand symbols are sorted for binary search
+string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
+datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
@@ -410,6 +415,11 @@ int OnInit()
    if(g_stmtQuoteInsert == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare quote insert stmt (err %d)", GetLastError());
 
+   g_stmtMetaInsert = DatabasePrepare(g_db,
+      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
+   if(g_stmtMetaInsert == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare meta insert stmt (err %d)", GetLastError());
+
    // Cache TF strings once — eliminates switch evaluation per symbol×TF per tick
    for(int t = 0; t < ArraySize(g_timeframes); t++)
       g_tfStrings[t] = TFToStr(g_timeframes[t]);
@@ -459,11 +469,14 @@ int OnInit()
       // Read demand list from TyphooN-Terminal (if present)
       // demand.txt v2: SYMBOL:TF:LAST_TS format (lines starting with # are comments)
       // v1 compat: plain symbol names (no colons) are treated as "all TFs, full export"
-      string demandSymbols[];    // flat symbol list (v1 compat)
+      string demandSymbols[];    // flat symbol list (v1 compat), sorted for binary search
+      ArrayResize(demandSymbols, 100);  // Pre-allocate to avoid quadratic resize
       int demandCount = 0;
       // v2: per-symbol:TF last timestamp — only export bars AFTER this time
       string demandKeys[];       // "EURUSD:1Hour"
       datetime demandTimestamps[];  // last known timestamp
+      ArrayResize(demandKeys, 100);
+      ArrayResize(demandTimestamps, 100);
       int demandV2Count = 0;
 
       string demandFile = g_accountTag + "_demand.txt";
@@ -488,8 +501,11 @@ int OnInit()
                string symTf = parts[0] + ":" + parts[1];
                long tsMs = StringToInteger(parts[2]);
                datetime ts = (datetime)(tsMs / 1000);
-               ArrayResize(demandKeys, demandV2Count + 1);
-               ArrayResize(demandTimestamps, demandV2Count + 1);
+               if(demandV2Count >= ArraySize(demandKeys))
+               {
+                  ArrayResize(demandKeys, demandV2Count * 2 + 1);
+                  ArrayResize(demandTimestamps, demandV2Count * 2 + 1);
+               }
                demandKeys[demandV2Count] = symTf;
                demandTimestamps[demandV2Count] = ts;
                demandV2Count++;
@@ -498,7 +514,8 @@ int OnInit()
                for(int di = 0; di < demandCount; di++)
                   if(demandSymbols[di] == parts[0]) { symFound = true; break; }
                if(!symFound) {
-                  ArrayResize(demandSymbols, demandCount + 1);
+                  if(demandCount >= ArraySize(demandSymbols))
+                     ArrayResize(demandSymbols, demandCount * 2 + 1);
                   demandSymbols[demandCount] = parts[0];
                   demandCount++;
                }
@@ -506,13 +523,31 @@ int OnInit()
             else if(nParts == 1)
             {
                // v1 format: plain symbol name
-               ArrayResize(demandSymbols, demandCount + 1);
+               if(demandCount >= ArraySize(demandSymbols))
+                  ArrayResize(demandSymbols, demandCount * 2 + 1);
                demandSymbols[demandCount] = line;
                demandCount++;
             }
          }
          FileClose(demandHandle);
-         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d v2 entries", demandCount, demandV2Count);
+         // Sort demand symbols for O(log n) binary search in main loop
+         if(demandCount > 1)
+         {
+            // Simple insertion sort on small array
+            for(int si = 1; si < demandCount; si++)
+            {
+               string tmp = demandSymbols[si];
+               int sj = si - 1;
+               while(sj >= 0 && StringCompare(demandSymbols[sj], tmp) > 0)
+               {
+                  demandSymbols[sj + 1] = demandSymbols[sj];
+                  sj--;
+               }
+               demandSymbols[sj + 1] = tmp;
+            }
+         }
+         g_demandSorted = true;
+         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", demandCount, demandV2Count);
       }
 
       int batchCount = 0;
@@ -697,9 +732,15 @@ void ExportAll()
       if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
       // Rotation: skip symbols outside current batch window UNLESS they're in demand list
-      bool isDemand = false;
-      for(int di = 0; di < demandCount; di++)
-         if(demandSymbols[di] == symbol) { isDemand = true; break; }
+      // O(log n) binary search on sorted demand array (was O(n) linear scan)
+      bool isDemand = (g_demandSorted && demandCount > 0)
+         ? BinarySearchKey(demandSymbols, demandCount, symbol) >= 0
+         : false;
+      if(!isDemand && demandCount > 0 && !g_demandSorted)
+      {
+         for(int di = 0; di < demandCount; di++)
+            if(demandSymbols[di] == symbol) { isDemand = true; break; }
+      }
       if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
 
@@ -899,44 +940,60 @@ void WriteSymbolList(int symCount)
       csv += s;
    }
 
-   int req = DatabasePrepare(g_db,
-      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-   if(req != INVALID_HANDLE)
+   // Use pre-prepared statement for metadata writes
+   if(g_stmtMetaInsert != INVALID_HANDLE)
    {
-      DatabaseBind(req, 0, "mt5:__SYMBOLS__:" + g_accountTag);
-      DatabaseBind(req, 1, "[\"" + StringReplace2(csv, ",", "\",\"") + "\"]");
-      DatabaseBind(req, 2, (long)TimeCurrent());
-      DatabaseBind(req, 3, (long)symCount);
-      DatabaseRead(req);
-      DatabaseFinalize(req);
+      DatabaseReset(g_stmtMetaInsert);
+      DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SYMBOLS__:" + g_accountTag);
+      DatabaseBind(g_stmtMetaInsert, 1, "[\"" + StringReplace2(csv, ",", "\",\"") + "\"]");
+      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+      DatabaseBind(g_stmtMetaInsert, 3, (long)symCount);
+      DatabaseRead(g_stmtMetaInsert);
    }
 
    // Store broker/server identity — TyphooN-Terminal reads this for data source badge
-   int srvReq = DatabasePrepare(g_db,
-      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-   if(srvReq != INVALID_HANDLE)
+   if(g_stmtMetaInsert != INVALID_HANDLE)
    {
       string server = AccountInfoString(ACCOUNT_SERVER);
       string company = AccountInfoString(ACCOUNT_COMPANY);
       string meta = "{\"server\":\"" + server + "\",\"company\":\"" + company + "\"}";
-      DatabaseBind(srvReq, 0, "mt5:__SERVER__:" + g_accountTag);
-      DatabaseBind(srvReq, 1, meta);
-      DatabaseBind(srvReq, 2, (long)TimeCurrent());
-      DatabaseBind(srvReq, 3, 0);
-      DatabaseRead(srvReq);
-      DatabaseFinalize(srvReq);
+      DatabaseReset(g_stmtMetaInsert);
+      DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SERVER__:" + g_accountTag);
+      DatabaseBind(g_stmtMetaInsert, 1, meta);
+      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+      DatabaseBind(g_stmtMetaInsert, 3, 0);
+      DatabaseRead(g_stmtMetaInsert);
    }
 }
 
 void WriteSymbolSpecs(int symCount)
 {
-   // Export symbol specs as CSV rows: one line per symbol, compact format
-   // TyphooN-Terminal does all heavy calculations (VaR, ATR, risk) — we just export raw specs
+   // v1.439: Cache specs and only rebuild when SpecsCacheMin has elapsed.
+   // SymbolInfo calls are expensive (~16 per symbol × 851 symbols = 13,616 calls).
+   // Specs rarely change (swap rates, margins updated by broker infrequently).
+   if(StringLen(g_cachedSpecsCsv) > 0 && g_specsLastBuild > 0
+      && TimeCurrent() - g_specsLastBuild < SpecsCacheMin * 60)
+   {
+      // Use cached CSV — just write it to DB (timestamps updated)
+      if(g_stmtMetaInsert != INVALID_HANDLE)
+      {
+         DatabaseReset(g_stmtMetaInsert);
+         DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SPECS__:" + g_accountTag);
+         DatabaseBind(g_stmtMetaInsert, 1, g_cachedSpecsCsv);
+         DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+         DatabaseBind(g_stmtMetaInsert, 3, (long)symCount);
+         DatabaseRead(g_stmtMetaInsert);
+      }
+      return;
+   }
+
+   // Rebuild specs CSV — build per-line then join (avoids quadratic string growth)
    // Format: Symbol,SectorName,IndustryName,TradeMode,SwapLong,SwapShort,Spread,
    //         VolumeMin,VolumeMax,VolumeStep,ContractSize,TickSize,TickValue,
    //         Digits,MarginInitial,MarginMaintenance,BaseCurrency,QuoteCurrency,Description
-   string csv = "";
+   string lines[];
    int count = 0;
+   ArrayResize(lines, symCount); // Pre-allocate (may be slightly over, that's fine)
 
    for(int i = 0; i < symCount; i++)
    {
@@ -967,7 +1024,8 @@ void WriteSymbolSpecs(int symCount)
       StringReplace(desc, "\n", " ");
       StringReplace(desc, "\r", "");
 
-      csv += s + ","
+      // Build line in single StringConcatenate (one allocation per line, not 19)
+      lines[count] = s + ","
            + sector + ","
            + industry + ","
            + IntegerToString(tradeMode) + ","
@@ -985,20 +1043,32 @@ void WriteSymbolSpecs(int symCount)
            + DoubleToString(marginMaint, 2) + ","
            + baseCcy + ","
            + quoteCcy + ","
-           + desc + "\n";
+           + desc;
       count++;
    }
 
-   int req = DatabasePrepare(g_db,
-      "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
-   if(req != INVALID_HANDLE)
+   // Join all lines with newline separator (single large allocation at the end)
+   string csv = "";
+   for(int i = 0; i < count; i++)
    {
-      DatabaseBind(req, 0, "mt5:__SPECS__:" + g_accountTag);
-      DatabaseBind(req, 1, csv);
-      DatabaseBind(req, 2, (long)TimeCurrent());
-      DatabaseBind(req, 3, (long)count);
-      DatabaseRead(req);
-      DatabaseFinalize(req);
+      if(i > 0) csv += "\n";
+      csv += lines[i];
+   }
+   csv += "\n";
+
+   // Cache the built CSV
+   g_cachedSpecsCsv = csv;
+   g_specsLastBuild = TimeCurrent();
+
+   // Write to DB using pre-prepared statement
+   if(g_stmtMetaInsert != INVALID_HANDLE)
+   {
+      DatabaseReset(g_stmtMetaInsert);
+      DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SPECS__:" + g_accountTag);
+      DatabaseBind(g_stmtMetaInsert, 1, csv);
+      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+      DatabaseBind(g_stmtMetaInsert, 3, (long)count);
+      DatabaseRead(g_stmtMetaInsert);
    }
 }
 
@@ -1240,6 +1310,7 @@ void OnDeinit(const int reason)
    if(g_stmtBarRead != INVALID_HANDLE)     { DatabaseFinalize(g_stmtBarRead);     g_stmtBarRead = INVALID_HANDLE; }
    if(g_stmtTrackInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtTrackInsert); g_stmtTrackInsert = INVALID_HANDLE; }
    if(g_stmtQuoteInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtQuoteInsert); g_stmtQuoteInsert = INVALID_HANDLE; }
+   if(g_stmtMetaInsert != INVALID_HANDLE)  { DatabaseFinalize(g_stmtMetaInsert);  g_stmtMetaInsert = INVALID_HANDLE; }
    if(g_db != INVALID_HANDLE)
    {
       DatabaseClose(g_db);
