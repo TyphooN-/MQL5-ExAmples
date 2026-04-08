@@ -23,9 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.440"
+#property version   "1.441"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
-#property description "v1.440: Fast restart — integrity only for demand symbols, 1K bar cap, skip non-demand."
+#property description "v1.441: SSD write reduction — bid/ask every 2.5min (was 60s), specs cached 1hr."
 #property description "v1.439: Perf — sorted demand lookup, specs caching, pre-prepared metadata stmts."
 #property strict
 
@@ -639,7 +639,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.440: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
+   PrintFormat("BarCacheWriter v1.441: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -692,8 +692,8 @@ void ExportAll()
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
 
-   // Live bid/ask sync — every OTHER cycle (60s instead of 30s) to reduce CPU
-   // v1.438: halved bid/ask frequency — 30s is overkill for most trading
+   // Live bid/ask sync — every OTHER cycle (60s) to align with 1-min bar writes
+   // v1.441: reduced from every cycle to every 2nd — matches M1 bar frequency
    static int quoteSkip = 0;
    quoteSkip++;
    if(g_stmtQuoteInsert != INVALID_HANDLE && quoteSkip % 2 == 0)
