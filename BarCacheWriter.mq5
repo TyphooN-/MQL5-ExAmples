@@ -48,6 +48,10 @@ bool g_demandSorted = false;                 // true after demand symbols are so
 string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 
+// Demand symbols — loaded from demand.txt in OnInit, used in ExportAll
+string g_demandSymbols[];     // flat symbol list (sorted for binary search)
+int g_demandCount = 0;
+
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
 // With 851 symbols × 9 TFs = 7,659 keys, this matters every tick
@@ -469,9 +473,9 @@ int OnInit()
       // Read demand list from TyphooN-Terminal (if present)
       // demand.txt v2: SYMBOL:TF:LAST_TS format (lines starting with # are comments)
       // v1 compat: plain symbol names (no colons) are treated as "all TFs, full export"
-      string demandSymbols[];    // flat symbol list (v1 compat), sorted for binary search
-      ArrayResize(demandSymbols, 100);  // Pre-allocate to avoid quadratic resize
-      int demandCount = 0;
+      // Use global g_demandSymbols / g_demandCount (shared with ExportAll)
+      ArrayResize(g_demandSymbols, 100);  // Pre-allocate to avoid quadratic resize
+      g_demandCount = 0;
       // v2: per-symbol:TF last timestamp — only export bars AFTER this time
       string demandKeys[];       // "EURUSD:1Hour"
       datetime demandTimestamps[];  // last known timestamp
@@ -511,43 +515,43 @@ int OnInit()
                demandV2Count++;
                // Also add symbol to flat list for v1 compat matching
                bool symFound = false;
-               for(int di = 0; di < demandCount; di++)
-                  if(demandSymbols[di] == parts[0]) { symFound = true; break; }
+               for(int di = 0; di < g_demandCount; di++)
+                  if(g_demandSymbols[di] == parts[0]) { symFound = true; break; }
                if(!symFound) {
-                  if(demandCount >= ArraySize(demandSymbols))
-                     ArrayResize(demandSymbols, demandCount * 2 + 1);
-                  demandSymbols[demandCount] = parts[0];
-                  demandCount++;
+                  if(g_demandCount >= ArraySize(g_demandSymbols))
+                     ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+                  g_demandSymbols[g_demandCount] = parts[0];
+                  g_demandCount++;
                }
             }
             else if(nParts == 1)
             {
                // v1 format: plain symbol name
-               if(demandCount >= ArraySize(demandSymbols))
-                  ArrayResize(demandSymbols, demandCount * 2 + 1);
-               demandSymbols[demandCount] = line;
-               demandCount++;
+               if(g_demandCount >= ArraySize(g_demandSymbols))
+                  ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+               g_demandSymbols[g_demandCount] = line;
+               g_demandCount++;
             }
          }
          FileClose(demandHandle);
          // Sort demand symbols for O(log n) binary search in main loop
-         if(demandCount > 1)
+         if(g_demandCount > 1)
          {
             // Simple insertion sort on small array
-            for(int si = 1; si < demandCount; si++)
+            for(int si = 1; si < g_demandCount; si++)
             {
-               string tmp = demandSymbols[si];
+               string tmp = g_demandSymbols[si];
                int sj = si - 1;
-               while(sj >= 0 && StringCompare(demandSymbols[sj], tmp) > 0)
+               while(sj >= 0 && StringCompare(g_demandSymbols[sj], tmp) > 0)
                {
-                  demandSymbols[sj + 1] = demandSymbols[sj];
+                  g_demandSymbols[sj + 1] = g_demandSymbols[sj];
                   sj--;
                }
-               demandSymbols[sj + 1] = tmp;
+               g_demandSymbols[sj + 1] = tmp;
             }
          }
          g_demandSorted = true;
-         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", demandCount, demandV2Count);
+         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", g_demandCount, demandV2Count);
       }
 
       int batchCount = 0;
@@ -559,12 +563,12 @@ int OnInit()
          if(!g_isCFDServer && IsForexSymbol(sym)) continue;
 
          // If demand list exists and this symbol isn't in it, defer to normal cycle
-         if(demandCount > 0)
+         if(g_demandCount > 0)
          {
             bool inDemand = false;
-            for(int di = 0; di < demandCount; di++)
+            for(int di = 0; di < g_demandCount; di++)
             {
-               if(demandSymbols[di] == sym) { inDemand = true; break; }
+               if(g_demandSymbols[di] == sym) { inDemand = true; break; }
             }
             if(!inDemand) continue;
          }
@@ -631,10 +635,10 @@ int OnInit()
       SafeCommit();
       uint intElapsed = GetTickCount() - intStart;
       PrintFormat("BarCacheWriter: startup integrity — %d keys checked, %d re-exported (%d bars) in %d ms, demand=%d",
-         checkedCount, reExportCount, totalReExportedBars, intElapsed, demandCount);
+         checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.438: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
+   PrintFormat("BarCacheWriter v1.439: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF");
@@ -733,13 +737,13 @@ void ExportAll()
 
       // Rotation: skip symbols outside current batch window UNLESS they're in demand list
       // O(log n) binary search on sorted demand array (was O(n) linear scan)
-      bool isDemand = (g_demandSorted && demandCount > 0)
-         ? BinarySearchKey(demandSymbols, demandCount, symbol) >= 0
+      bool isDemand = (g_demandSorted && g_demandCount > 0)
+         ? BinarySearchKey(g_demandSymbols, g_demandCount, symbol) >= 0
          : false;
-      if(!isDemand && demandCount > 0 && !g_demandSorted)
+      if(!isDemand && g_demandCount > 0 && !g_demandSorted)
       {
-         for(int di = 0; di < demandCount; di++)
-            if(demandSymbols[di] == symbol) { isDemand = true; break; }
+         for(int di = 0; di < g_demandCount; di++)
+            if(g_demandSymbols[di] == symbol) { isDemand = true; break; }
       }
       if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
