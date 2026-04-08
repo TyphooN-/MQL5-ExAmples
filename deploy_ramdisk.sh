@@ -16,7 +16,18 @@
 
 set -euo pipefail
 
-RAMDISK="/dev/shm"
+# Auto-detect ramdisk: prefer /dev/shm, fall back to /run/user/$UID, then /tmp
+if [ -d /dev/shm ] && df /dev/shm 2>/dev/null | grep -q tmpfs; then
+    RAMDISK="/dev/shm"
+elif [ -d "/run/user/$(id -u)" ] && df "/run/user/$(id -u)" 2>/dev/null | grep -q tmpfs; then
+    RAMDISK="/run/user/$(id -u)"
+elif [ -d /tmp ] && df /tmp 2>/dev/null | grep -q tmpfs; then
+    RAMDISK="/tmp"
+else
+    echo "ERROR: No tmpfs ramdisk found (/dev/shm, /run/user/$UID, /tmp)"
+    echo "BarCacheWriter will write directly to disk (slower, more SSD wear)"
+    exit 1
+fi
 MT5_BASE="$HOME"
 DB_NAME="typhoon_mt5_cache.db"
 
