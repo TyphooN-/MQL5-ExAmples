@@ -23,10 +23,10 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.439"
+#property version   "1.440"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
-#property description "v1.439: Perf — sorted demand lookup, linear CSV build, specs caching, pre-prepared metadata stmts."
-#property description "v1.437: Batched integrity, demand.txt, OOM fix."
+#property description "v1.440: Fast restart — integrity only for demand symbols, 1K bar cap, skip non-demand."
+#property description "v1.439: Perf — sorted demand lookup, specs caching, pre-prepared metadata stmts."
 #property strict
 
 
@@ -35,7 +35,8 @@ input bool   MarketWatchOnly   = false;  // false = ALL broker symbols
 input int    BatchSize         = 10;     // Symbols per SQLite transaction
 input bool   ForceReExport     = false;  // true = clear tracking, re-export all history once
 input bool   IntegrityCheck    = true;   // Verify bar counts on startup, re-export short keys
-input int    SpecsCacheMin     = 60;    // Minutes between full symbol spec refreshes (default 1h)
+input int    InitialBarCap     = 1000;   // Max bars per key on startup integrity (1000 = fast restart)
+input int    SpecsCacheMin     = 60;     // Minutes between full symbol spec refreshes (default 1h)
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -468,7 +469,7 @@ int OnInit()
       uint intStart = GetTickCount();
       int symCount = SymbolsTotal(MarketWatchOnly);
       #define INTEGRITY_BATCH_SIZE 20  // Commit every N symbols to release memory
-      #define INTEGRITY_BAR_CAP 10000  // Cap bars during integrity (full history via normal cycle)
+      // Use configurable InitialBarCap (default 1000) — incremental sync fills the rest
 
       // Read demand list from TyphooN-Terminal (if present)
       // demand.txt v2: SYMBOL:TF:LAST_TS format (lines starting with # are comments)
@@ -562,14 +563,14 @@ int OnInit()
          if(StringLen(sym) == 0) continue;
          if(!g_isCFDServer && IsForexSymbol(sym)) continue;
 
-         // If demand list exists and this symbol isn't in it, defer to normal cycle
+         // v1.440: Skip non-demand symbols entirely during integrity — incremental sync fills them.
+         // Only demand symbols (from TyphooN-Terminal) need immediate data on restart.
+         // If no demand list, check all symbols (backwards compat).
          if(g_demandCount > 0)
          {
-            bool inDemand = false;
-            for(int di = 0; di < g_demandCount; di++)
-            {
-               if(g_demandSymbols[di] == sym) { inDemand = true; break; }
-            }
+            bool inDemand = (g_demandSorted)
+               ? BinarySearchKey(g_demandSymbols, g_demandCount, sym) >= 0
+               : false;
             if(!inDemand) continue;
          }
 
@@ -598,11 +599,11 @@ int OnInit()
             }
             checkedCount++;
 
-            // Re-export if DB has <50% of MT5's available bars
-            if(dbCount < mt5Count / 2)
+            // Re-export if DB is empty or very short (<100 bars) — incremental sync fills the gap
+            if(dbCount < 100)
             {
-               // Cap bars during integrity to prevent OOM — full history fills via normal 30s cycle
-               int maxBars = MathMin(MaxBarsForTF(enumTf), INTEGRITY_BAR_CAP);
+               // Cap bars during integrity — full history fills via incremental 30s cycle
+               int maxBars = MathMin(MaxBarsForTF(enumTf), InitialBarCap);
                int bars = ExportSymbolTF(sym, enumTf, maxBars);
                if(bars > 0)
                {
@@ -638,10 +639,11 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.439: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s",
+   PrintFormat("BarCacheWriter v1.440: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
-      IntegrityCheck ? "ON" : "OFF");
+      IntegrityCheck ? "ON" : "OFF",
+      InitialBarCap);
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
