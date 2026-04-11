@@ -56,6 +56,7 @@ private:
     double m_dailyReturns[];
 
     bool GetAssetStdDevReturns(string VolSymbolName, double &StandardDevOfReturns);
+    int  BinarySearchCache(string sym);
     double InverseCumulativeNormal(double p);
     double StdDev(const double &arr[], int count);
 };
@@ -203,21 +204,34 @@ double CPortfolioRiskMan::InverseCumulativeNormal(double p)
    Print("Error: p is out of range in InverseCumulativeNormal");
    return 0;
 }
+// Binary search on sorted m_symbolCache — O(log n) instead of O(n) linear scan.
+// Returns index if found, or -(insertionPoint + 1) if not found.
+int CPortfolioRiskMan::BinarySearchCache(string sym)
+{
+    int lo = 0, hi = m_cacheCount - 1;
+    while(lo <= hi)
+    {
+        int mid = (lo + hi) / 2;
+        int cmp = StringCompare(m_symbolCache[mid], sym);
+        if(cmp == 0) return mid;
+        if(cmp < 0) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -(lo + 1); // encode insertion point
+}
+
 bool CPortfolioRiskMan::GetAssetStdDevReturns(string VolSymbolName, double &StandardDevOfReturns)
 {
-    // Cache lookup — linear scan (sufficient for typical use; batch callers should ClearCache between batches)
-    for (int i = 0; i < m_cacheCount; i++)
+    // Cache lookup — O(log n) binary search on sorted symbol array
+    int idx = BinarySearchCache(VolSymbolName);
+    if (idx >= 0)
     {
-        if (m_symbolCache[i] == VolSymbolName)
+        if (TimeCurrent() - m_cacheTimestamp[idx] < 300) // 5 minutes
         {
-            if (TimeCurrent() - m_cacheTimestamp[i] < 300) // 5 minutes
-            {
-                StandardDevOfReturns = m_stdDevReturnsCache[i];
-                return true;
-            }
-            // Stale — recompute and update in place
-            break;
+            StandardDevOfReturns = m_stdDevReturnsCache[idx];
+            return true;
         }
+        // Stale — recompute and update in place below
     }
 
     // CopyClose into pre-allocated work array (avoids heap alloc per call)
@@ -247,27 +261,36 @@ bool CPortfolioRiskMan::GetAssetStdDevReturns(string VolSymbolName, double &Stan
         return false;
     }
 
-    // Update or append cache entry
-    int slot = -1;
-    for (int i = 0; i < m_cacheCount; i++)
+    // Update existing stale entry in place
+    if (idx >= 0)
     {
-        if (m_symbolCache[i] == VolSymbolName) { slot = i; break; }
+        m_stdDevReturnsCache[idx] = StandardDevOfReturns;
+        m_cacheTimestamp[idx] = TimeCurrent();
+        return true;
     }
-    if (slot == -1)
+
+    // Insert new entry at sorted position to maintain O(log n) lookup
+    int insertAt = -(idx + 1); // decode insertion point
+    int capacity = ArraySize(m_symbolCache);
+    if (m_cacheCount >= capacity)
     {
-        int capacity = ArraySize(m_symbolCache);
-        if (m_cacheCount >= capacity)
-        {
-            int newCap = (capacity == 0) ? 256 : capacity * 2;
-            ArrayResize(m_symbolCache, newCap);
-            ArrayResize(m_stdDevReturnsCache, newCap);
-            ArrayResize(m_cacheTimestamp, newCap);
-        }
-        slot = m_cacheCount++;
+        int newCap = (capacity == 0) ? 256 : capacity * 2;
+        ArrayResize(m_symbolCache, newCap);
+        ArrayResize(m_stdDevReturnsCache, newCap);
+        ArrayResize(m_cacheTimestamp, newCap);
     }
-    m_symbolCache[slot] = VolSymbolName;
-    m_stdDevReturnsCache[slot] = StandardDevOfReturns;
-    m_cacheTimestamp[slot] = TimeCurrent();
+
+    // Shift elements right to make room at insertAt
+    for (int i = m_cacheCount; i > insertAt; i--)
+    {
+        m_symbolCache[i] = m_symbolCache[i - 1];
+        m_stdDevReturnsCache[i] = m_stdDevReturnsCache[i - 1];
+        m_cacheTimestamp[i] = m_cacheTimestamp[i - 1];
+    }
+    m_symbolCache[insertAt] = VolSymbolName;
+    m_stdDevReturnsCache[insertAt] = StandardDevOfReturns;
+    m_cacheTimestamp[insertAt] = TimeCurrent();
+    m_cacheCount++;
 
     return true;
 }

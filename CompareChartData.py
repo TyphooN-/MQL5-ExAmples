@@ -123,7 +123,19 @@ def main():
         sys.exit(1)
 
     print(f"Loading Darwinex data from {csv_path}...")
-    darwinex_df = load_darwinex_data(csv_path)
+    try:
+        darwinex_df = load_darwinex_data(csv_path)
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        sys.exit(1)
+
+    if darwinex_df.empty:
+        print("No data found in CSV")
+        sys.exit(1)
+
+    if 'Symbol' not in darwinex_df.columns:
+        print("Error: 'Symbol' column not found in CSV")
+        sys.exit(1)
 
     symbols = darwinex_df['Symbol'].unique()
     print(f"Found {len(symbols)} symbols to compare against Yahoo Finance.\n")
@@ -147,7 +159,11 @@ def main():
 
         base = os.path.splitext(csv_path)[0]
         report_path = f"{base}-Anomalies.csv"
-        report_df.to_csv(report_path, index=False)
+        try:
+            report_df.to_csv(report_path, index=False)
+        except OSError as e:
+            print(f"Error writing report: {e}")
+            sys.exit(1)
 
         print(f"\n{'='*70}")
         print(f"ANOMALY REPORT: {len(results)} symbols with data discrepancies")

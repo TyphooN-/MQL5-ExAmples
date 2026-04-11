@@ -85,7 +85,7 @@ int OnInit()
     int file_handle = FileOpen(filename, FILE_WRITE | FILE_CSV | FILE_ANSI);
     if (file_handle == INVALID_HANDLE)
     {
-        Print("ERROR: Cannot open file ", filename);
+        PrintFormat("ERROR: Cannot open file %s (error %d)", filename, GetLastError());
         ExpertRemove();
         return(INIT_FAILED);
     }

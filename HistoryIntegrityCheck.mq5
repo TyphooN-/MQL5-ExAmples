@@ -39,7 +39,7 @@ void OnStart()
    int handle = FileOpen(filename, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
    if (handle == INVALID_HANDLE)
    {
-      PrintFormat("ERROR: Cannot open file %s for writing", filename);
+      PrintFormat("ERROR: Cannot open file %s for writing (error %d)", filename, GetLastError());
       return;
    }
    FileWrite(handle, "Symbol", "BrokerATH", "BrokerATL", "MN1Bars", "EarliestDate", "LatestDate",
@@ -50,7 +50,9 @@ void OnStart()
    int symbols_skipped = 0;
    int symbols_no_data = 0;
    // Track which symbols we added to Market Watch so we can clean up
+   // Pre-allocate to avoid O(n) ArrayResize per element
    string added_symbols[];
+   ArrayResize(added_symbols, total_symbols, total_symbols);
    int added_count = 0;
    PrintFormat("Scanning ALL %d symbols on server for history integrity...", total_symbols);
    for (int i = 0; i < total_symbols; i++)
@@ -73,7 +75,6 @@ void OnStart()
       if (!was_selected)
       {
          SymbolSelect(symbol, true);
-         ArrayResize(added_symbols, added_count + 1);
          added_symbols[added_count] = symbol;
          added_count++;
       }

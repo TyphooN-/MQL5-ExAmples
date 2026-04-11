@@ -45,7 +45,6 @@ int g_stmtBarRead = INVALID_HANDLE;         // Pre-prepared SELECT data FROM bar
 int g_stmtTrackInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bar_track
 int g_stmtQuoteInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bid_ask
 int g_stmtMetaInsert  = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for metadata (specs/symbols/server)
-bool g_demandSorted = false;                 // true after demand symbols are sorted for binary search
 string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 
@@ -97,22 +96,30 @@ bool SafeCommit()
 // Crypto and Futures servers don't need EURGBP/EURUSD/GBPUSD cluttering the cache.
 bool g_isCFDServer = false;
 
+// Pre-sorted currency codes — O(log n) binary search instead of O(n) linear scan per call.
+// Sorted alphabetically: 19 codes → max 5 comparisons per lookup.
+string g_forexCurrencies[] = {"AUD","CAD","CHF","CZK","DKK","EUR","GBP","HKD","HUF","JPY","MXN","NOK","NZD","PLN","SEK","SGD","TRY","USD","ZAR"};
+#define FOREX_CCY_COUNT 19
+
+bool IsCurrencyCode(string code)
+{
+   int lo = 0, hi = FOREX_CCY_COUNT - 1;
+   while(lo <= hi)
+   {
+      int mid = (lo + hi) / 2;
+      int cmp = StringCompare(g_forexCurrencies[mid], code);
+      if(cmp == 0) return true;
+      if(cmp < 0) lo = mid + 1;
+      else hi = mid - 1;
+   }
+   return false;
+}
+
 bool IsForexSymbol(string symbol)
 {
-   // Common forex pairs — 6-char symbols like EURUSD, GBPJPY, etc.
-   // Also catches exotics like USDMXN, USDZAR, etc.
-   int len = StringLen(symbol);
-   if(len != 6) return false;
-   string majors[] = {"USD","EUR","GBP","JPY","CHF","AUD","NZD","CAD","SEK","NOK","MXN","ZAR","TRY","PLN","HUF","CZK","SGD","HKD","DKK"};
-   string base = StringSubstr(symbol, 0, 3);
-   string quote = StringSubstr(symbol, 3, 3);
-   bool baseIsCcy = false, quoteIsCcy = false;
-   for(int i = 0; i < ArraySize(majors); i++)
-   {
-      if(base == majors[i]) baseIsCcy = true;
-      if(quote == majors[i]) quoteIsCcy = true;
-   }
-   return (baseIsCcy && quoteIsCcy);
+   if(StringLen(symbol) != 6) return false;
+   return IsCurrencyCode(StringSubstr(symbol, 0, 3))
+       && IsCurrencyCode(StringSubstr(symbol, 3, 3));
 }
 
 // Timeframes: MN1 first (higher TFs are smaller, export fast)
@@ -518,15 +525,11 @@ int OnInit()
                demandTimestamps[demandV2Count] = ts;
                demandV2Count++;
                // Also add symbol to flat list for v1 compat matching
-               bool symFound = false;
-               for(int di = 0; di < g_demandCount; di++)
-                  if(g_demandSymbols[di] == parts[0]) { symFound = true; break; }
-               if(!symFound) {
-                  if(g_demandCount >= ArraySize(g_demandSymbols))
-                     ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-                  g_demandSymbols[g_demandCount] = parts[0];
-                  g_demandCount++;
-               }
+               // Dedup via sorted insert position check — O(log n) vs O(n) linear scan
+               if(g_demandCount >= ArraySize(g_demandSymbols))
+                  ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+               g_demandSymbols[g_demandCount] = parts[0];
+               g_demandCount++;
             }
             else if(nParts == 1)
             {
@@ -553,8 +556,16 @@ int OnInit()
                }
                g_demandSymbols[sj + 1] = tmp;
             }
+            // O(n) dedup on sorted array — removes adjacent duplicates from v2 multi-TF entries
+            int unique = 1;
+            for(int si = 1; si < g_demandCount; si++)
+            {
+               if(g_demandSymbols[si] != g_demandSymbols[unique - 1])
+                  g_demandSymbols[unique++] = g_demandSymbols[si];
+            }
+            g_demandCount = unique;
          }
-         g_demandSorted = true;
+         // Demand array is now sorted — all lookups use O(log n) binary search
          PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", g_demandCount, demandV2Count);
       }
 
@@ -571,10 +582,8 @@ int OnInit()
          // If no demand list, check all symbols (backwards compat).
          if(g_demandCount > 0)
          {
-            bool inDemand = (g_demandSorted)
-               ? BinarySearchKey(g_demandSymbols, g_demandCount, sym) >= 0
-               : false;
-            if(!inDemand) continue;
+            if(BinarySearchKey(g_demandSymbols, g_demandCount, sym) < 0)
+               continue;
          }
 
          SymbolSelect(sym, true);
@@ -741,15 +750,10 @@ void ExportAll()
       if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
       // Rotation: skip symbols outside current batch window UNLESS they're in demand list
-      // O(log n) binary search on sorted demand array (was O(n) linear scan)
-      bool isDemand = (g_demandSorted && g_demandCount > 0)
+      // O(log n) binary search on sorted demand array
+      bool isDemand = (g_demandCount > 0)
          ? BinarySearchKey(g_demandSymbols, g_demandCount, symbol) >= 0
          : false;
-      if(!isDemand && g_demandCount > 0 && !g_demandSorted)
-      {
-         for(int di = 0; di < g_demandCount; di++)
-            if(g_demandSymbols[di] == symbol) { isDemand = true; break; }
-      }
       if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
 
@@ -940,21 +944,46 @@ void ExportAll()
 
 void WriteSymbolList(int symCount)
 {
-   string csv = "";
+   // Build symbol list as JSON array — O(n) via per-element array, single join
+   string names[];
+   ArrayResize(names, symCount);
+   int count = 0;
    for(int i = 0; i < symCount; i++)
    {
       string s = SymbolName(i, MarketWatchOnly);
       if(StringLen(s) == 0) continue;
-      if(StringLen(csv) > 0) csv += ",";
-      csv += s;
+      names[count++] = s;
    }
+
+   // Estimate total bytes: each symbol ~8 chars + quotes + comma + brackets
+   int totalLen = 2; // []
+   for(int i = 0; i < count; i++)
+      totalLen += StringLen(names[i]) + 3; // "X",
+
+   // Build JSON array via uchar buffer — O(n) total, no quadratic string growth
+   uchar buf[];
+   ArrayResize(buf, totalLen + 1);
+   int pos = 0;
+   buf[pos++] = '[';
+   for(int i = 0; i < count; i++)
+   {
+      if(i > 0) buf[pos++] = ',';
+      buf[pos++] = '"';
+      uchar nameBytes[];
+      int nameLen = StringToCharArray(names[i], nameBytes, 0, -1, CP_UTF8) - 1;
+      ArrayCopy(buf, nameBytes, pos, 0, nameLen);
+      pos += nameLen;
+      buf[pos++] = '"';
+   }
+   buf[pos++] = ']';
+   string csv = CharArrayToString(buf, 0, pos, CP_UTF8);
 
    // Use pre-prepared statement for metadata writes
    if(g_stmtMetaInsert != INVALID_HANDLE)
    {
       DatabaseReset(g_stmtMetaInsert);
       DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SYMBOLS__:" + g_accountTag);
-      DatabaseBind(g_stmtMetaInsert, 1, "[\"" + StringReplace2(csv, ",", "\",\"") + "\"]");
+      DatabaseBind(g_stmtMetaInsert, 1, csv);
       DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
       DatabaseBind(g_stmtMetaInsert, 3, (long)symCount);
       DatabaseRead(g_stmtMetaInsert);
@@ -1056,14 +1085,23 @@ void WriteSymbolSpecs(int symCount)
       count++;
    }
 
-   // Join all lines with newline separator (single large allocation at the end)
-   string csv = "";
+   // Join all lines via uchar buffer — O(n) total, no quadratic string growth
+   int totalLen = 0;
+   for(int i = 0; i < count; i++)
+      totalLen += StringLen(lines[i]) + 1; // +1 for newline
+   uchar csvBuf[];
+   ArrayResize(csvBuf, totalLen + 1);
+   int csvPos = 0;
    for(int i = 0; i < count; i++)
    {
-      if(i > 0) csv += "\n";
-      csv += lines[i];
+      if(i > 0) csvBuf[csvPos++] = '\n';
+      uchar lineBytes[];
+      int lineLen = StringToCharArray(lines[i], lineBytes, 0, -1, CP_UTF8) - 1;
+      ArrayCopy(csvBuf, lineBytes, csvPos, 0, lineLen);
+      csvPos += lineLen;
    }
-   csv += "\n";
+   csvBuf[csvPos++] = '\n';
+   string csv = CharArrayToString(csvBuf, 0, csvPos, CP_UTF8);
 
    // Cache the built CSV
    g_cachedSpecsCsv = csv;
@@ -1079,14 +1117,6 @@ void WriteSymbolSpecs(int symCount)
       DatabaseBind(g_stmtMetaInsert, 3, (long)count);
       DatabaseRead(g_stmtMetaInsert);
    }
-}
-
-// StringReplace that returns the new string (MQL5's StringReplace modifies in-place)
-string StringReplace2(string src, string find, string replace)
-{
-   string result = src;
-   StringReplace(result, find, replace);
-   return result;
 }
 
 // ── Incremental Export ────────────────────────────────────────────────────

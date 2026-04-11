@@ -111,7 +111,8 @@ void ProcessRequests()
    FileClose(handle);
 
    // Delete request file immediately (prevents re-processing)
-   FileDelete(reqFile);
+   if(!FileDelete(reqFile))
+      PrintFormat("BarServer: WARNING — failed to delete %s (error %d), may re-process", reqFile, GetLastError());
 
    if(StringLen(line) == 0) return;
 

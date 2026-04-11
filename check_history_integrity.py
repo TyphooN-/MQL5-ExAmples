@@ -94,10 +94,18 @@ def main():
 
     # Parse broker CSV (semicolon-delimited)
     symbols = []
-    with open(csv_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            symbols.append(row)
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for row in reader:
+                symbols.append(row)
+    except (OSError, csv.Error) as e:
+        print(f"Error reading CSV: {e}")
+        sys.exit(1)
+
+    if not symbols:
+        print(f"No data rows found in {csv_path.name}")
+        sys.exit(1)
 
     print(f"Loaded {len(symbols)} symbols from {csv_path.name}")
     print(f"Checking against Yahoo Finance (this may take a while)...\n")
@@ -255,7 +263,12 @@ def main():
 
     if bad_history:
         out_path = f"{stem}-BAD.csv"
-        with open(out_path, "w", newline="") as f:
+        try:
+            f = open(out_path, "w", newline="")
+        except OSError as e:
+            print(f"Error writing {out_path}: {e}")
+            sys.exit(1)
+        with f:
             writer = csv.writer(f)
             writer.writerow(["Symbol", "Ticker", "BrokerATH", "YahooATH", "ATHRatio",
                              "BrokerBars", "YahooMonths", "BarsRatio",
@@ -276,7 +289,12 @@ def main():
 
     if no_data:
         out_path = f"{stem}-NODATA.csv"
-        with open(out_path, "w", newline="") as f:
+        try:
+            f = open(out_path, "w", newline="")
+        except OSError as e:
+            print(f"Error writing {out_path}: {e}")
+            sys.exit(1)
+        with f:
             writer = csv.writer(f)
             writer.writerow(["Symbol", "Sector", "Industry", "Description"])
             for nd in no_data:
@@ -285,7 +303,12 @@ def main():
 
     if errors:
         out_path = f"{stem}-ERRORS.csv"
-        with open(out_path, "w", newline="") as f:
+        try:
+            f = open(out_path, "w", newline="")
+        except OSError as e:
+            print(f"Error writing {out_path}: {e}")
+            sys.exit(1)
+        with f:
             writer = csv.writer(f)
             writer.writerow(["Symbol", "Ticker", "BrokerATH", "BrokerBars", "Error"])
             for e in errors:

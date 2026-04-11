@@ -144,7 +144,7 @@ void ExportSymbolsToCSV()
     int file_handle = FileOpen(CSVFilePath, FILE_WRITE | FILE_CSV | FILE_ANSI);
     if (file_handle == INVALID_HANDLE)
     {
-        Print("Failed to open file: ", CSVFilePath);
+        PrintFormat("Failed to open file: %s (error %d)", CSVFilePath, GetLastError());
         return;
     }
 

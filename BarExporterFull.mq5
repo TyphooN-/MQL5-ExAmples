@@ -141,9 +141,14 @@ bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int barCount)
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
 
-   // Re-copy after download (may have more bars now)
-   int copied = CopyRates(symbol, tf, 0, barCount, rates);
-   if(copied <= 0) return false;
+   // Re-copy full range after download (date range captures more than position-based copy)
+   int copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
+   if(copied <= 0)
+   {
+      PrintFormat("  ExportSymbolTF: CopyRates failed for %s %s (error %d)",
+         symbol, TFToTerminalString(tf), GetLastError());
+      return false;
+   }
 
    string tfStr = TFToTerminalString(tf);
    string filename = GetExportDir() + "/" + symbol + "_" + tfStr + ".csv";

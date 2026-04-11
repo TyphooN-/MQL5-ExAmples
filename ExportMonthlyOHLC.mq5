@@ -36,7 +36,7 @@ void OnStart()
    int handle = FileOpen(filename, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
    if (handle == INVALID_HANDLE)
    {
-      PrintFormat("ERROR: Cannot open file %s for writing", filename);
+      PrintFormat("ERROR: Cannot open file %s for writing (error %d)", filename, GetLastError());
       return;
    }
    // Header

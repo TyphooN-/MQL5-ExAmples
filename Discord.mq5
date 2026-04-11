@@ -31,6 +31,7 @@ double LastBearPowerLTF = -1;
 datetime LastPowerNotification = 0;
 const int NotificationCoolDown = 1200;
 const int MaxVerifyAttempts = 10;
+string g_cachedWebhookURL = "";  // O(1) lookup — resolved once in OnInit, _Symbol never changes
 input string AgricultureAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string CryptoAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string EnergyAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
@@ -56,6 +57,9 @@ string StocksSymbols[]     = {"AAPL", "AMZN", "BABA", "BAC", "GOOG", "META", "MS
                               "ZM", "ALVG", "BAYGn", "AIRF", "DBKGn", "VOWG_p", "IBE", "LVMH"};
 int OnInit()
 {
+   g_cachedWebhookURL = GetWebhookURL();
+   if(g_cachedWebhookURL == "")
+      PrintFormat("Discord: WARNING — %s not mapped to any sector webhook, notifications disabled", _Symbol);
    return(INIT_SUCCEEDED);
 }
 bool IsSymbolInArray(const string &arr[], string sym)
@@ -115,8 +119,7 @@ bool ReadAndVerifyPower(double &bullHTF, double &bearHTF, double &bullLTF, doubl
 }
 void SendPowerNotification()
 {
-   string url = GetWebhookURL();
-   if(url == "") return;
+   if(g_cachedWebhookURL == "") return;
    double bullHTF, bearHTF, bullLTF, bearLTF;
    if(!ReadAndVerifyPower(bullHTF, bearHTF, bullLTF, bearLTF))
       return;
@@ -144,7 +147,16 @@ void SendPowerNotification()
    string headers = "Content-Type: application/json";
    uchar result[];
    string result_headers;
-   WebRequest("POST", url, headers, 5000, jsonArray, result, result_headers);
+   int httpCode = WebRequest("POST", g_cachedWebhookURL, headers, 5000, jsonArray, result, result_headers);
+   if(httpCode == -1)
+   {
+      int err = GetLastError();
+      PrintFormat("Discord: WebRequest failed for %s (error %d) — check URL allowlist in Tools→Options→Expert Advisors", _Symbol, err);
+   }
+   else if(httpCode >= 400)
+   {
+      PrintFormat("Discord: webhook returned HTTP %d for %s", httpCode, _Symbol);
+   }
    LastPowerNotification = TimeCurrent();
 }
 void OnTick()

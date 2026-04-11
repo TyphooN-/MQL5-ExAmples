@@ -145,13 +145,17 @@ void PlaceMarketOrder()
    else
       trade.Sell(OrderLots, _Symbol, 0.0, sl, tp, "Queued Sell Market Order");
 
-   if (trade.ResultRetcode() == TRADE_RETCODE_DONE)
+   uint retcode = trade.ResultRetcode();
+   if (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED)
    {
-      Print("Order successfully placed.");
+      PrintFormat("Order placed: %s %.2f lots @ %s, SL=%s, TP=%s",
+         isBuy ? "BUY" : "SELL", OrderLots,
+         DoubleToString(price, digits), DoubleToString(sl, digits), DoubleToString(tp, digits));
       orderPlaced = true;
    }
    else
    {
-      Print("Failed to place order. Error: ", trade.ResultRetcode());
+      PrintFormat("Failed to place order: retcode=%d, error=%d, desc=%s",
+         retcode, GetLastError(), trade.ResultComment());
    }
 }

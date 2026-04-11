@@ -25,24 +25,42 @@ def fetch_monthly_volumes(symbols):
         dict: Dictionary mapping symbol to its latest monthly volume, or None if unavailable.
     """
     try:
-        # Fetch data for all symbols at once
         data = yf.download(symbols, period="1mo")
-        # Initialize a dictionary to store results
+        if data.empty:
+            print("Warning: yf.download returned empty DataFrame")
+            return {s: None for s in symbols}
+
         volumes = {}
-        # Extract the latest volume for each symbol
+        # Handle single-symbol case (no MultiIndex columns)
+        if len(symbols) == 1:
+            sym = symbols[0]
+            if 'Volume' in data.columns and not data['Volume'].empty:
+                volumes[sym] = data['Volume'].iloc[-1]
+            else:
+                volumes[sym] = None
+            return volumes
+
+        # Multi-symbol case
+        if 'Volume' not in data.columns:
+            print("Warning: 'Volume' column not in downloaded data")
+            return {s: None for s in symbols}
+
         for symbol in symbols:
-            if symbol in data['Volume']:
-                vol_df = data['Volume'][symbol]
-                if not vol_df.empty:
-                    volumes[symbol] = vol_df.iloc[-1]
+            try:
+                if symbol in data['Volume']:
+                    vol_df = data['Volume'][symbol]
+                    if not vol_df.empty:
+                        volumes[symbol] = vol_df.iloc[-1]
+                    else:
+                        volumes[symbol] = None
                 else:
                     volumes[symbol] = None
-            else:
+            except (KeyError, IndexError):
                 volumes[symbol] = None
         return volumes
     except Exception as e:
         print(f"Error fetching data for symbols: {e}")
-        return None
+        return {s: None for s in symbols}
 
 
 def main(input_csv_path, output_csv_path):

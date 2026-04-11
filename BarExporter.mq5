@@ -72,8 +72,11 @@ int OnInit()
    string dir = GetExportDir();
    // MQL5 creates subdirectories under MQL5/Files/ automatically
    PrintFormat("BarExporter v1.000: exporting to MQL5/Files/%s/ every %ds", dir, UpdateIntervalSec);
-   PrintFormat("BarExporter: %s symbols, max %d bars/TF, %d timeframes",
-      MarketWatchOnly ? "Market Watch" : "ALL", MaxBarsPerTF, ArraySize(g_timeframes));
+   PrintFormat("BarExporter: %s symbols, maxBars=%s, overrideCap=%d, %d timeframes",
+      MarketWatchOnly ? "Market Watch" : "ALL",
+      MaxBars ? "ALL" : "10000",
+      MaxBarsOverride,
+      ArraySize(g_timeframes));
 
    EventSetTimer(UpdateIntervalSec);
 

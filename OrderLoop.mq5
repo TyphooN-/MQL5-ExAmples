@@ -37,16 +37,22 @@ void OnTick()
 bool PlaceSellOrder()
 {
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   Print("Attempting to place a sell order at price: ", price);
+   if(price <= 0)
+   {
+      PrintFormat("No valid bid price for %s (error %d)", _Symbol, GetLastError());
+      return false;
+   }
+   PrintFormat("Placing sell order: %.0f lots @ %s", Lots, DoubleToString(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)));
    if(trade.Sell(Lots, _Symbol, price, 0, 0, "Sell " + DoubleToString(Lots, 0) + " lots"))
    {
       LotsSold += Lots;
-      Print("Sell order placed successfully. Total lots sold: ", LotsSold);
+      PrintFormat("Sell OK. Total lots sold: %.0f / %.0f", LotsSold, TotalLotsToSell);
       return true;
    }
    else
    {
-      Print("Failed to place sell order. Error: ", GetLastError());
+      PrintFormat("Sell failed: retcode=%d, error=%d, desc=%s",
+         trade.ResultRetcode(), GetLastError(), trade.ResultComment());
       return false;
    }
 }

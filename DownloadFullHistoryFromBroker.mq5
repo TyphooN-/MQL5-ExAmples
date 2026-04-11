@@ -49,7 +49,9 @@ void OnStart()
    int total_symbols = SymbolsTotal(false);
    int success_count = 0;
    int failure_count = 0;
-   string failed_symbols = "";
+   // Array-based failure tracking — O(n) total vs O(n²) string concatenation
+   string failed_entries[];
+   ArrayResize(failed_entries, 0, total_symbols * ArraySize(timeframes));
    PrintFormat("Total symbols available from broker: %d", total_symbols);
    for (int i = 0; i < total_symbols; i++)
    {
@@ -63,7 +65,9 @@ void OnStart()
             else
             {
                failure_count++;
-               failed_symbols += StringFormat("%s (timeframe: %s)\n", symbol, EnumToString(timeframes[t]));
+               int idx = ArraySize(failed_entries);
+               ArrayResize(failed_entries, idx + 1, 256);
+               failed_entries[idx] = StringFormat("%s (timeframe: %s)", symbol, EnumToString(timeframes[t]));
             }
          }
       }
@@ -72,6 +76,10 @@ void OnStart()
    PrintFormat("Total symbols processed: %d", total_symbols);
    PrintFormat("Successfully downloaded data for %d timeframes.", success_count);
    PrintFormat("Failed to download data for %d timeframes.", failure_count);
-   if (failed_symbols != "")
-      PrintFormat("Failed symbols and timeframes:\n%s", failed_symbols);
+   if (ArraySize(failed_entries) > 0)
+   {
+      PrintFormat("Failed symbols and timeframes:");
+      for (int i = 0; i < ArraySize(failed_entries); i++)
+         Print("  ", failed_entries[i]);
+   }
 }

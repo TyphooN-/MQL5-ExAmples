@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)" || { echo "ERROR: cannot resolve script directory"; exit 1; }
 SRC_INCLUDE="$REPO_DIR/Include"
 
 # All .mq5 files in repo root are scripts/EAs → deploy to Experts/
@@ -18,6 +18,13 @@ if [ -d "$SRC_INCLUDE" ]; then
         INCLUDE_FILES+=("${f#"$SRC_INCLUDE/"}")
     done < <(find "$SRC_INCLUDE" -type f \( -name '*.mqh' -o -name '*.mq5' \) -print0)
 fi
+
+if [ ${#EXPERT_FILES[@]} -eq 0 ] && [ ${#INCLUDE_FILES[@]} -eq 0 ]; then
+    echo "ERROR: No .mq5 or .mqh files found in $REPO_DIR"
+    exit 1
+fi
+
+echo "Found ${#EXPERT_FILES[@]} expert files, ${#INCLUDE_FILES[@]} include files"
 
 copied=0
 skipped=0

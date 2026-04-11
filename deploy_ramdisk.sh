@@ -88,14 +88,21 @@ for name in $ACTIVE_INSTANCES; do
     if [ -f "$db_path" ]; then
         size=$(du -h "$db_path" | cut -f1)
         echo "  $name: copying existing DB ($size) to ramdisk — zero data loss"
-        cp "$db_path" "$ramdisk_db"
+        if ! cp "$db_path" "$ramdisk_db"; then
+            echo "  ERROR: failed to copy DB to ramdisk — check disk space on $RAMDISK"
+            echo "  Available: $(df -h "$RAMDISK" | tail -1 | awk '{print $4}')"
+            continue
+        fi
         rm "$db_path"
     elif [ -f "$ramdisk_db" ]; then
         echo "  $name: ramdisk DB already exists ($(du -h "$ramdisk_db" | cut -f1))"
     fi
 
     # Create symlink: MQL5/Files/typhoon_mt5_cache.db → /dev/shm/typhoon_mt5_cache_.mt5_X.db
-    ln -sf "$ramdisk_db" "$db_path"
+    if ! ln -sf "$ramdisk_db" "$db_path"; then
+        echo "  ERROR: failed to create symlink $db_path → $ramdisk_db"
+        continue
+    fi
     echo "  $name: $db_path → $ramdisk_db"
 done
 
