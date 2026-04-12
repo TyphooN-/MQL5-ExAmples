@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.442"
+#property version   "1.443"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.443: Deeper Wine-overhead pass — O(1) demand bitmap, track-time dirty flag bulk flush (10× fewer bar_track writes), skip redundant specs DB writes."
 #property description "v1.442: Startup O(N²)→O(N) via direct-append in LoadTrackingFromDB; hoist TimeCurrent() out of inner TF loop (7659→1 syscall/cycle)."
 #property description "v1.441: SSD write reduction — bid/ask every 2.5min (was 60s), specs cached 1hr."
 #property description "v1.439: Perf — sorted demand lookup, specs caching, pre-prepared metadata stmts."
@@ -48,10 +49,18 @@ int g_stmtQuoteInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE fo
 int g_stmtMetaInsert  = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for metadata (specs/symbols/server)
 string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
+datetime g_specsLastDbWrite = 0;             // v1.443: When specs CSV was last persisted to DB (skip redundant writes)
 
 // Demand symbols — loaded from demand.txt in OnInit, used in ExportAll
 string g_demandSymbols[];     // flat symbol list (sorted for binary search)
 int g_demandCount = 0;
+
+// v1.443 perf: O(1) demand-symbol membership check. Parallel array indexed by
+// the MT5 symbol index (SymbolName(i, MarketWatchOnly)). Rebuilt once at OnInit
+// after demand.txt is loaded, and on symCount change if detected. Replaces
+// O(log m) BinarySearchKey call inside the hot 851-symbol outer loop.
+bool g_isDemandIdx[];
+int  g_demandIdxSymCount = 0;  // symCount at time of last bitmap rebuild
 
 // Track last bar time per symbol:TF to skip unchanged data
 // Uses sorted arrays + binary search for O(log n) lookup instead of O(n) linear scan
@@ -61,6 +70,16 @@ datetime g_trackTimes[];
 int g_trackFails[];  // Consecutive export failures per key — give up after MAX_CONSEC_FAILS
 int g_trackCount = 0;
 bool g_trackSorted = true; // false when new keys appended, triggers re-sort
+
+// v1.443: Track-time dirty flags — lets us defer DB persistence of bar_track
+// updates from the hot export loop to a bulk end-of-cycle flush. In-memory
+// state is authoritative; DB is a recovery checkpoint written periodically.
+// At worst a crash loses ≤TRACK_FLUSH_CYCLES * UpdateIntervalSec seconds of
+// tracking state, after which the next ExportSymbolTF call re-detects and
+// re-exports any delta. Net effect: ~10× fewer bar_track DB writes per cycle.
+bool g_trackDirty[];
+int  g_trackFlushCounter = 0;
+#define TRACK_FLUSH_CYCLES 10   // Flush dirty track updates every N export cycles
 #define MAX_CONSEC_FAILS 10  // Give up on a symbol/TF after this many consecutive failures
 #define FAIL_SENTINEL  1     // Sentinel timestamp: marks "permanently failed, stop retrying"
 #define MAX_BARS_PER_KEY 100000  // Hard cap: trim oldest bars during incremental merge if exceeded
@@ -187,6 +206,26 @@ int BinarySearchKey(const string &keys[], int count, string key)
    return -1;
 }
 
+// v1.443 perf: Rebuild the O(1) demand bitmap for the current symbol count.
+// Called after demand.txt load in OnInit and lazily on symCount change in ExportAll.
+// Cost: O(N log M) once, then O(1) per-symbol membership check in hot loops
+// (replacing the O(log M) BinarySearchKey call that ran twice per symbol per cycle).
+void RebuildDemandIndexBitmap(int symCount)
+{
+   if(symCount <= 0) return;
+   ArrayResize(g_isDemandIdx, symCount);
+   ArrayInitialize(g_isDemandIdx, false);
+   if(g_demandCount <= 0) { g_demandIdxSymCount = symCount; return; }
+   for(int i = 0; i < symCount; i++)
+   {
+      string s = SymbolName(i, MarketWatchOnly);
+      if(StringLen(s) == 0) continue;
+      if(BinarySearchKey(g_demandSymbols, g_demandCount, s) >= 0)
+         g_isDemandIdx[i] = true;
+   }
+   g_demandIdxSymCount = symCount;
+}
+
 // Sort tracking arrays by key (insertion sort — only runs when new keys added)
 void SortTrackArrays()
 {
@@ -283,14 +322,20 @@ int GetTrackIndex(string key)
    ArrayResize(g_trackKeys, g_trackCount, 1024); // reserve 1024 extra to reduce reallocs
    ArrayResize(g_trackTimes, g_trackCount, 1024);
    ArrayResize(g_trackFails, g_trackCount, 1024);
+   ArrayResize(g_trackDirty, g_trackCount, 1024);
    g_trackKeys[g_trackCount - 1] = key;
    g_trackTimes[g_trackCount - 1] = 0;
    g_trackFails[g_trackCount - 1] = 0;
+   g_trackDirty[g_trackCount - 1] = false;
    g_trackSorted = false;
    return g_trackCount - 1;
 }
 
-// Persist last bar time to DB so we survive restarts
+// Persist last bar time to DB so we survive restarts.
+// v1.443: Not called from the hot export loop any more — callers mark
+// g_trackDirty[idx] = true instead and FlushDirtyTrackTimes() persists them
+// in bulk at cycle end (every TRACK_FLUSH_CYCLES cycles). Retained for the
+// FAIL_SENTINEL path and OnDeinit where immediate persistence matters.
 void SaveTrackTime(string trackKey, datetime barTime)
 {
    if(g_stmtTrackInsert == INVALID_HANDLE) return;
@@ -298,6 +343,35 @@ void SaveTrackTime(string trackKey, datetime barTime)
    DatabaseBind(g_stmtTrackInsert, 0, trackKey);
    DatabaseBind(g_stmtTrackInsert, 1, (long)barTime);
    DatabaseRead(g_stmtTrackInsert);
+}
+
+// v1.443: Flush all dirty bar_track entries to DB in one transaction.
+// Called periodically from ExportAll (every TRACK_FLUSH_CYCLES cycles) and
+// on OnDeinit. Returns count of rows flushed.
+int FlushDirtyTrackTimes()
+{
+   if(g_stmtTrackInsert == INVALID_HANDLE || g_trackCount == 0) return 0;
+   int dirtyN = 0;
+   for(int i = 0; i < g_trackCount; i++)
+      if(g_trackDirty[i]) dirtyN++;
+   if(dirtyN == 0) return 0;
+
+   if(!SafeBegin()) return 0;
+   int flushed = 0;
+   for(int i = 0; i < g_trackCount; i++)
+   {
+      if(!g_trackDirty[i]) continue;
+      DatabaseReset(g_stmtTrackInsert);
+      DatabaseBind(g_stmtTrackInsert, 0, g_trackKeys[i]);
+      DatabaseBind(g_stmtTrackInsert, 1, (long)g_trackTimes[i]);
+      if(DatabaseRead(g_stmtTrackInsert))
+      {
+         g_trackDirty[i] = false;
+         flushed++;
+      }
+   }
+   SafeCommit();
+   return flushed;
 }
 
 // Load existing key→timestamp mapping from DB so we don't re-export after restart.
@@ -335,6 +409,7 @@ void LoadTrackingFromDB()
       ArrayResize(g_trackKeys,  resv);
       ArrayResize(g_trackTimes, resv);
       ArrayResize(g_trackFails, resv);
+      ArrayResize(g_trackDirty, resv);
    }
 
    int loaded = 0;
@@ -358,10 +433,12 @@ void LoadTrackingFromDB()
          ArrayResize(g_trackKeys,  grow);
          ArrayResize(g_trackTimes, grow);
          ArrayResize(g_trackFails, grow);
+         ArrayResize(g_trackDirty, grow);
       }
       g_trackKeys[idx]  = key;
       g_trackTimes[idx] = (datetime)ts;
       g_trackFails[idx] = 0;
+      g_trackDirty[idx] = false;
       loaded++;
    }
    DatabaseFinalize(req);
@@ -613,6 +690,8 @@ int OnInit()
          // Demand array is now sorted — all lookups use O(log n) binary search
          PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", g_demandCount, demandV2Count);
       }
+      // v1.443: Build the O(1) demand bitmap once now that the sorted list is ready.
+      RebuildDemandIndexBitmap(symCount);
 
       int batchCount = 0;
       SafeBegin();
@@ -625,9 +704,10 @@ int OnInit()
          // v1.440: Skip non-demand symbols entirely during integrity — incremental sync fills them.
          // Only demand symbols (from TyphooN-Terminal) need immediate data on restart.
          // If no demand list, check all symbols (backwards compat).
+         // v1.443: O(1) bitmap lookup instead of O(log m) binary search.
          if(g_demandCount > 0)
          {
-            if(BinarySearchKey(g_demandSymbols, g_demandCount, sym) < 0)
+            if(si >= g_demandIdxSymCount || !g_isDemandIdx[si])
                continue;
          }
 
@@ -792,6 +872,11 @@ void ExportAll()
    // once per (symbol, tf) = 7,659 syscalls per cycle; now it's once per cycle.
    datetime cycleNow = TimeCurrent();
 
+   // v1.443: Rebuild demand bitmap if symCount changed since last rebuild.
+   // Cheap safety check — typical cost is zero (no rebuild needed).
+   if(g_demandCount > 0 && g_demandIdxSymCount != symCount)
+      RebuildDemandIndexBitmap(symCount);
+
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
@@ -800,11 +885,11 @@ void ExportAll()
       // Skip forex symbols on non-CFD servers
       if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
-      // Rotation: skip symbols outside current batch window UNLESS they're in demand list
-      // O(log n) binary search on sorted demand array
-      bool isDemand = (g_demandCount > 0)
-         ? BinarySearchKey(g_demandSymbols, g_demandCount, symbol) >= 0
-         : false;
+      // Rotation: skip symbols outside current batch window UNLESS they're in demand list.
+      // v1.443: O(1) bitmap lookup replaces O(log m) BinarySearchKey call.
+      bool isDemand = (g_demandCount > 0 && i < g_demandIdxSymCount)
+                      ? g_isDemandIdx[i]
+                      : false;
       if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
 
@@ -877,7 +962,7 @@ void ExportAll()
                if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
-                  SaveTrackTime(trackKey, lastRate[0].time);
+                  g_trackDirty[idx] = true; // v1.443: defer DB persistence to bulk flush
                }
             }
             else
@@ -913,7 +998,7 @@ void ExportAll()
             if(gotLast == 1)
             {
                g_trackTimes[idx] = lastRate[0].time;
-               SaveTrackTime(trackKey, lastRate[0].time);
+               g_trackDirty[idx] = true; // v1.443: defer DB persistence to bulk flush
             }
          }
       }
@@ -937,6 +1022,20 @@ void ExportAll()
    // Sort tracking arrays after population phase for O(log n) lookups on subsequent ticks
    if(!g_trackSorted && g_trackCount > 0)
       SortTrackArrays();
+
+   // v1.443: Periodically flush dirty bar_track entries in one transaction.
+   // In-memory state is authoritative between flushes — on crash we lose at
+   // most TRACK_FLUSH_CYCLES cycles of tracking state, which the next cycle's
+   // ExportSymbolTF re-detects via lastRate[0].time comparison. Net effect:
+   // ~10× fewer bar_track DB writes per cycle under steady-state operation.
+   g_trackFlushCounter++;
+   if(g_trackFlushCounter >= TRACK_FLUSH_CYCLES)
+   {
+      int flushed = FlushDirtyTrackTimes();
+      g_trackFlushCounter = 0;
+      if(flushed > 0)
+         PrintFormat("BarCacheWriter: flushed %d dirty track rows", flushed);
+   }
 
    // Periodic compact: VACUUM every ~2 hours to reclaim /dev/shm space
    if(g_cycleCount % 240 == 0 && g_cycleCount > 0)
@@ -1059,18 +1158,28 @@ void WriteSymbolSpecs(int symCount)
    // v1.439: Cache specs and only rebuild when SpecsCacheMin has elapsed.
    // SymbolInfo calls are expensive (~16 per symbol × 851 symbols = 13,616 calls).
    // Specs rarely change (swap rates, margins updated by broker infrequently).
+   // v1.443: When the cache is fresh AND we already persisted it recently,
+   // skip the DB write entirely. The caller gate writes metadata every 5 min
+   // but specs content only changes every SpecsCacheMin (default 60 min), so
+   // 11/12 of those write calls are redundant.
+   datetime tc = TimeCurrent();
    if(StringLen(g_cachedSpecsCsv) > 0 && g_specsLastBuild > 0
-      && TimeCurrent() - g_specsLastBuild < SpecsCacheMin * 60)
+      && tc - g_specsLastBuild < SpecsCacheMin * 60)
    {
-      // Use cached CSV — just write it to DB (timestamps updated)
+      // Cache is fresh. If we already wrote this same CSV to the DB within the
+      // cache window, skip the write — the on-disk row is still current.
+      if(g_specsLastDbWrite > 0 && tc - g_specsLastDbWrite < SpecsCacheMin * 60)
+         return;
+      // Otherwise use cached CSV — write it to DB (timestamps updated).
       if(g_stmtMetaInsert != INVALID_HANDLE)
       {
          DatabaseReset(g_stmtMetaInsert);
          DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SPECS__:" + g_accountTag);
          DatabaseBind(g_stmtMetaInsert, 1, g_cachedSpecsCsv);
-         DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+         DatabaseBind(g_stmtMetaInsert, 2, (long)tc);
          DatabaseBind(g_stmtMetaInsert, 3, (long)symCount);
          DatabaseRead(g_stmtMetaInsert);
+         g_specsLastDbWrite = tc;
       }
       return;
    }
@@ -1177,9 +1286,10 @@ void WriteSymbolSpecs(int symCount)
       DatabaseReset(g_stmtMetaInsert);
       DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SPECS__:" + g_accountTag);
       DatabaseBind(g_stmtMetaInsert, 1, csv);
-      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+      DatabaseBind(g_stmtMetaInsert, 2, (long)g_specsLastBuild);
       DatabaseBind(g_stmtMetaInsert, 3, (long)count);
       DatabaseRead(g_stmtMetaInsert);
+      g_specsLastDbWrite = g_specsLastBuild; // v1.443: track last successful DB write
    }
 }
 
@@ -1409,6 +1519,11 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   // v1.443: Final flush of any dirty track entries before shutdown so we
+   // don't lose the last batch of updates from in-memory state.
+   int finalFlushed = FlushDirtyTrackTimes();
+   if(finalFlushed > 0)
+      PrintFormat("BarCacheWriter: final flush persisted %d dirty track rows", finalFlushed);
    if(g_stmtBarInsert != INVALID_HANDLE)   { DatabaseFinalize(g_stmtBarInsert);   g_stmtBarInsert = INVALID_HANDLE; }
    if(g_stmtBarRead != INVALID_HANDLE)     { DatabaseFinalize(g_stmtBarRead);     g_stmtBarRead = INVALID_HANDLE; }
    if(g_stmtTrackInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtTrackInsert); g_stmtTrackInsert = INVALID_HANDLE; }
