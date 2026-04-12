@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.441"
+#property version   "1.442"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.442: Startup O(N²)→O(N) via direct-append in LoadTrackingFromDB; hoist TimeCurrent() out of inner TF loop (7659→1 syscall/cycle)."
 #property description "v1.441: SSD write reduction — bid/ask every 2.5min (was 60s), specs cached 1hr."
 #property description "v1.439: Perf — sorted demand lookup, specs caching, pre-prepared metadata stmts."
 #property strict
@@ -299,14 +300,42 @@ void SaveTrackTime(string trackKey, datetime barTime)
    DatabaseRead(g_stmtTrackInsert);
 }
 
-// Load existing key→timestamp mapping from DB so we don't re-export after restart
+// Load existing key→timestamp mapping from DB so we don't re-export after restart.
+// Keys from the DB are guaranteed unique (bar_track primary key), so we bypass
+// GetTrackIndex entirely and direct-append. Previously each row called GetTrackIndex
+// which, with g_trackSorted=false during population, did a linear scan through the
+// already-loaded entries — giving O(N²) total startup cost at 7,659 keys
+// (≈58M comparisons). Direct-append is O(N) and sorts once at the end.
 void LoadTrackingFromDB()
 {
    if(g_db == INVALID_HANDLE) return;
 
+   // Count first so we can ArrayResize once instead of growing incrementally.
+   int total = 0;
+   int cntReq = DatabasePrepare(g_db, "SELECT COUNT(*) FROM bar_track");
+   if(cntReq != INVALID_HANDLE)
+   {
+      if(DatabaseRead(cntReq))
+      {
+         long n = 0;
+         DatabaseColumnLong(cntReq, 0, n);
+         total = (int)n;
+      }
+      DatabaseFinalize(cntReq);
+   }
+
    int req = DatabasePrepare(g_db,
       "SELECT key, last_bar_time FROM bar_track");
    if(req == INVALID_HANDLE) return;
+
+   // Single up-front allocation with a small safety margin for new keys added later.
+   if(total > 0)
+   {
+      int resv = total + 256;
+      ArrayResize(g_trackKeys,  resv);
+      ArrayResize(g_trackTimes, resv);
+      ArrayResize(g_trackFails, resv);
+   }
 
    int loaded = 0;
    while(DatabaseRead(req))
@@ -317,14 +346,30 @@ void LoadTrackingFromDB()
       DatabaseColumnLong(req, 1, ts);
 
       if(ts <= 0) continue;
-      int idx = GetTrackIndex(key);
+
+      // Direct append — no GetTrackIndex lookup. Keys are unique by DB constraint.
+      int idx = g_trackCount;
+      g_trackCount++;
+      // Defensive: if COUNT(*) was stale (shouldn't happen under the prepared tx,
+      // but be safe) — grow in chunks to preserve amortized O(1).
+      if(idx >= ArraySize(g_trackKeys))
+      {
+         int grow = g_trackCount + 1024;
+         ArrayResize(g_trackKeys,  grow);
+         ArrayResize(g_trackTimes, grow);
+         ArrayResize(g_trackFails, grow);
+      }
+      g_trackKeys[idx]  = key;
       g_trackTimes[idx] = (datetime)ts;
+      g_trackFails[idx] = 0;
       loaded++;
    }
    DatabaseFinalize(req);
 
+   // Mark unsorted and sort once for O(log n) lookups on subsequent ticks.
    if(loaded > 0)
    {
+      g_trackSorted = false;
       SortTrackArrays();
       PrintFormat("BarCacheWriter: restored %d cached keys from DB (skip re-export on restart)", loaded);
    }
@@ -741,6 +786,12 @@ void ExportAll()
    static int rotationOffset = 0;
    int symbolsPerCycle = BatchSize * 10; // default 100 symbols per 30s cycle
 
+   // Perf: hoist TimeCurrent() out of the inner TF loop. A full cycle takes up to
+   // 30s of wall-clock, but within the ~1s window of a single symbol's TF scan
+   // it cannot move enough to alter gating decisions. Previously this was called
+   // once per (symbol, tf) = 7,659 syscalls per cycle; now it's once per cycle.
+   datetime cycleNow = TimeCurrent();
+
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
@@ -776,10 +827,9 @@ void ExportAll()
          // at 30s intervals, only M1 is checked every cycle; M5 every ~4 min,
          // H1 every ~48 min, D1 every ~19 hours, etc.
          int tfPeriod = PeriodSeconds(g_timeframes[tf]);
-         datetime now = TimeCurrent();
          if(g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
          {
-            int elapsed = (int)(now - g_tfLastExportTime[tf]);
+            int elapsed = (int)(cycleNow - g_tfLastExportTime[tf]);
             if(elapsed < (int)(tfPeriod * 0.8))
             {
                skipped++;
@@ -823,7 +873,7 @@ void ExportAll()
                exported++;
                totalBars += bars;
                g_trackFails[idx] = 0;
-               g_tfLastExportTime[tf] = now;
+               g_tfLastExportTime[tf] = cycleNow;
                if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
@@ -859,7 +909,7 @@ void ExportAll()
          {
             exported++;
             totalBars += bars;
-            g_tfLastExportTime[tf] = now; // update TF gate timer
+            g_tfLastExportTime[tf] = cycleNow; // update TF gate timer
             if(gotLast == 1)
             {
                g_trackTimes[idx] = lastRate[0].time;
@@ -1057,10 +1107,24 @@ void WriteSymbolSpecs(int symCount)
       string quoteCcy = SymbolInfoString(s, SYMBOL_CURRENCY_PROFIT);
       string desc = SymbolInfoString(s, SYMBOL_DESCRIPTION);
 
-      // Sanitize description (remove commas/newlines that would break CSV)
-      StringReplace(desc, ",", ";");
-      StringReplace(desc, "\n", " ");
-      StringReplace(desc, "\r", "");
+      // Single-pass sanitize (commas/newlines break CSV) — avoids 3× full-string scans
+      {
+         int dLen = StringLen(desc);
+         if(dLen > 0)
+         {
+            uchar dBuf[];
+            int dBytes = StringToCharArray(desc, dBuf, 0, -1, CP_UTF8) - 1;
+            int wp = 0;
+            for(int c = 0; c < dBytes; c++)
+            {
+               if(dBuf[c] == ',')       dBuf[wp++] = ';';
+               else if(dBuf[c] == '\n') dBuf[wp++] = ' ';
+               else if(dBuf[c] == '\r') continue; // skip \r entirely
+               else                     dBuf[wp++] = dBuf[c];
+            }
+            desc = CharArrayToString(dBuf, 0, wp, CP_UTF8);
+         }
+      }
 
       // Build line in single StringConcatenate (one allocation per line, not 19)
       lines[count] = s + ","
