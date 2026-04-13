@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.443"
+#property version   "1.444"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.444: Fix specs CSV buffer overflow on non-ASCII descriptions (e.g. USDMXN's 'México' expands in UTF-8) — measure byte length, not char count."
 #property description "v1.443: Deeper Wine-overhead pass — O(1) demand bitmap, track-time dirty flag bulk flush (10× fewer bar_track writes), skip redundant specs DB writes."
 #property description "v1.442: Startup O(N²)→O(N) via direct-append in LoadTrackingFromDB; hoist TimeCurrent() out of inner TF loop (7659→1 syscall/cycle)."
 #property description "v1.441: SSD write reduction — bid/ask every 2.5min (was 60s), specs cached 1hr."
@@ -776,7 +777,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.441: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
+   PrintFormat("BarCacheWriter v1.444: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1258,12 +1259,19 @@ void WriteSymbolSpecs(int symCount)
       count++;
    }
 
-   // Join all lines via uchar buffer — O(n) total, no quadratic string growth
+   // v1.444: Measure UTF-8 bytes (not UTF-16 chars) — non-ASCII descriptions like "México" overflow otherwise
    int totalLen = 0;
-   for(int i = 0; i < count; i++)
-      totalLen += StringLen(lines[i]) + 1; // +1 for newline
+   {
+      uchar scratch[];
+      for(int i = 0; i < count; i++)
+      {
+         int bLen = StringToCharArray(lines[i], scratch, 0, -1, CP_UTF8) - 1;
+         if(bLen < 0) bLen = 0;
+         totalLen += bLen + 1; // +1 for newline separator/terminator
+      }
+   }
    uchar csvBuf[];
-   ArrayResize(csvBuf, totalLen + 1);
+   if(ArrayResize(csvBuf, totalLen + 1) < 0) { Print("BarCacheWriter: ArrayResize csvBuf failed (",totalLen+1," bytes)"); return; }
    int csvPos = 0;
    for(int i = 0; i < count; i++)
    {
