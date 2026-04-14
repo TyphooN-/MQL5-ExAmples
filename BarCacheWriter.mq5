@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.444"
+#property version   "1.445"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.445: Cache TF periods (7659 PeriodSeconds calls/cycle → 0), cache g_tfCount, consolidate TimeCurrent() calls in ExportAll."
 #property description "v1.444: Fix specs CSV buffer overflow on non-ASCII descriptions (e.g. USDMXN's 'México' expands in UTF-8) — measure byte length, not char count."
 #property description "v1.443: Deeper Wine-overhead pass — O(1) demand bitmap, track-time dirty flag bulk flush (10× fewer bar_track writes), skip redundant specs DB writes."
 #property description "v1.442: Startup O(N²)→O(N) via direct-append in LoadTrackingFromDB; hoist TimeCurrent() out of inner TF loop (7659→1 syscall/cycle)."
@@ -150,6 +151,10 @@ ENUM_TIMEFRAMES g_timeframes[] = {
 };
 // Pre-cached TF strings — avoids 7,659 switch evaluations per tick
 string g_tfStrings[9];
+// Pre-cached TF periods (seconds) — avoids 7,659 PeriodSeconds() calls per tick
+int g_tfPeriods[9];
+// Cached ArraySize(g_timeframes) — avoids function call in the hot TF loop
+int g_tfCount = 9;
 
 // Max bars per timeframe — 0 = ALL available history from server (no limit)
 // Uses CopyRates(symbol, tf, D'1970.01.01', TimeCurrent(), rates) for full history
@@ -558,9 +563,14 @@ int OnInit()
    if(g_stmtMetaInsert == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare meta insert stmt (err %d)", GetLastError());
 
-   // Cache TF strings once — eliminates switch evaluation per symbol×TF per tick
-   for(int t = 0; t < ArraySize(g_timeframes); t++)
+   // Cache TF strings + periods once — eliminates 7,659 switch evals and 7,659
+   // PeriodSeconds() syscalls per tick inside the hot (symbol × tf) loop.
+   g_tfCount = ArraySize(g_timeframes);
+   for(int t = 0; t < g_tfCount; t++)
+   {
       g_tfStrings[t] = TFToStr(g_timeframes[t]);
+      g_tfPeriods[t] = PeriodSeconds(g_timeframes[t]);
+   }
 
    int initSymCount = SymbolsTotal(MarketWatchOnly);
 
@@ -714,7 +724,7 @@ int OnInit()
 
          SymbolSelect(sym, true);
 
-         for(int ti = 0; ti < ArraySize(g_timeframes); ti++)
+         for(int ti = 0; ti < g_tfCount; ti++)
          {
             ENUM_TIMEFRAMES enumTf = g_timeframes[ti];
             int mt5Count = Bars(sym, enumTf);
@@ -777,7 +787,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.444: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
+   PrintFormat("BarCacheWriter v1.445: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -806,11 +816,15 @@ void ExportAll()
 
    uint tickStart = GetTickCount();
    int symCount = SymbolsTotal(MarketWatchOnly);
+   // Hoist TimeCurrent() once — reused for log gating, meta gating, quote stamps,
+   // and TF gating below. One syscall per cycle instead of 5+.
+   datetime cycleNow = TimeCurrent();
+
    static datetime lastTickLog = 0;
-   if(TimeCurrent() - lastTickLog > 300)
+   if(cycleNow - lastTickLog > 300)
    {
       PrintFormat("BarCacheWriter: tick start — %d symbols", symCount);
-      lastTickLog = TimeCurrent();
+      lastTickLog = cycleNow;
    }
 
    int exported = 0, skipped = 0, totalBars = 0;
@@ -818,13 +832,13 @@ void ExportAll()
    // Write metadata only every 5 minutes (not every tick) — avoids unnecessary DB writes
    // that change file mtime and prevent the Rust sync's fast-path mtime check
    static datetime lastMetaWrite = 0;
-   if(lastMetaWrite == 0 || TimeCurrent() - lastMetaWrite >= 300)
+   if(lastMetaWrite == 0 || cycleNow - lastMetaWrite >= 300)
    {
       SafeBegin();
       WriteSymbolList(symCount);
       WriteSymbolSpecs(symCount);
       SafeCommit();
-      lastMetaWrite = TimeCurrent();
+      lastMetaWrite = cycleNow;
    }
    uint afterMeta = GetTickCount();
    if(afterMeta - tickStart > 1000)
@@ -837,7 +851,7 @@ void ExportAll()
    if(g_stmtQuoteInsert != INVALID_HANDLE && quoteSkip % 2 == 0)
    {
       SafeBegin();
-      long now = (long)TimeCurrent();
+      long now = (long)cycleNow;
       int quoteCount = 0;
       for(int q = 0; q < symCount; q++)
       {
@@ -866,12 +880,6 @@ void ExportAll()
    // Demand symbols (from TyphooN-Terminal) are ALWAYS processed every cycle for low latency.
    static int rotationOffset = 0;
    int symbolsPerCycle = BatchSize * 10; // default 100 symbols per 30s cycle
-
-   // Perf: hoist TimeCurrent() out of the inner TF loop. A full cycle takes up to
-   // 30s of wall-clock, but within the ~1s window of a single symbol's TF scan
-   // it cannot move enough to alter gating decisions. Previously this was called
-   // once per (symbol, tf) = 7,659 syscalls per cycle; now it's once per cycle.
-   datetime cycleNow = TimeCurrent();
 
    // v1.443: Rebuild demand bitmap if symCount changed since last rebuild.
    // Cheap safety check — typical cost is zero (no rebuild needed).
@@ -904,7 +912,7 @@ void ExportAll()
          batchCount = 0;
       }
 
-      for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
+      for(int tf = 0; tf < g_tfCount; tf++)
       {
          // TF gating: skip TFs that can't have new bars yet.
          // If less than 80% of the TF period has elapsed since last export,
@@ -912,7 +920,7 @@ void ExportAll()
          // near bar boundaries. This eliminates ~90% of CopyRates calls:
          // at 30s intervals, only M1 is checked every cycle; M5 every ~4 min,
          // H1 every ~48 min, D1 every ~19 hours, etc.
-         int tfPeriod = PeriodSeconds(g_timeframes[tf]);
+         int tfPeriod = g_tfPeriods[tf];
          if(g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
          {
             int elapsed = (int)(cycleNow - g_tfLastExportTime[tf]);

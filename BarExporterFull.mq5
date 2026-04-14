@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.000"
+#property version   "1.001"
 #property description "Downloads FULL bar history from broker for ALL symbols, then exports."
 #property description "Run once to seed the cache, then use BarExporter.mq5 for updates."
 #property description "Downloads from 1970-01-01 to present for max history depth."
@@ -37,6 +37,11 @@ ENUM_TIMEFRAMES g_timeframes[] = {
    PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
    PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
+
+// Init-time caches — avoid recomputing constants inside hot export loop.
+string g_exportDir = "";
+string g_tfStrings[];   // parallel to g_timeframes, built once in OnInit
+int    g_tfCount = 0;
 
 string TFToTerminalString(ENUM_TIMEFRAMES tf)
 {
@@ -63,16 +68,16 @@ string FormatRFC3339(datetime dt)
       mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
 }
 
-string GetExportDir()
-{
-   if(CustomExportPath != "")
-      return CustomExportPath;
-   return "typhoon-bars";
-}
-
 int OnInit()
 {
-   PrintFormat("BarExporterFull v1.000: downloading FULL history for %s symbols",
+   g_exportDir = (CustomExportPath != "") ? CustomExportPath : "typhoon-bars";
+   g_tfCount = ArraySize(g_timeframes);
+   ArrayResize(g_tfStrings, g_tfCount);
+   for(int i = 0; i < g_tfCount; i++)
+      g_tfStrings[i] = TFToTerminalString(g_timeframes[i]);
+   FolderCreate(g_exportDir, 0);
+
+   PrintFormat("BarExporterFull v1.001: downloading FULL history for %s symbols",
       MarketWatchOnly ? "Market Watch" : "ALL");
 
    // Run on timer so MT5 has time to initialize
@@ -86,37 +91,42 @@ void OnTimer()
 
    int symCount = SymbolsTotal(MarketWatchOnly);
    PrintFormat("BarExporterFull: processing %d symbols × %d timeframes...",
-      symCount, ArraySize(g_timeframes));
+      symCount, g_tfCount);
 
    int totalExported = 0;
    int totalBars = 0;
+   // Hoist TimeCurrent() — a single "now" for the entire download session; drift
+   // across ~minutes of per-symbol downloads is immaterial for historical bars.
+   datetime nowTs = TimeCurrent();
 
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
 
-      for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
+      // Hoist digits once per symbol — 7659 SymbolInfoInteger calls → 851.
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+      for(int tf = 0; tf < g_tfCount; tf++)
       {
          // Download full history and export in one pass — avoids redundant CopyRates
          MqlRates rates[];
          ArraySetAsSeries(rates, false);
-         int bars = CopyRates(symbol, g_timeframes[tf], D'1970.01.01 00:00', TimeCurrent(), rates);
+         int bars = CopyRates(symbol, g_timeframes[tf], D'1970.01.01 00:00', nowTs, rates);
          if(bars <= 0) continue;
 
-         if(ExportRates(symbol, g_timeframes[tf], rates, bars))
+         if(ExportRates(symbol, g_tfStrings[tf], rates, bars, digits))
          {
             totalExported++;
             totalBars += bars;
          }
 
-         PrintFormat("  %s @ %s: %d bars exported",
-            symbol, TFToTerminalString(g_timeframes[tf]), bars);
+         PrintFormat("  %s @ %s: %d bars exported", symbol, g_tfStrings[tf], bars);
       }
    }
 
    PrintFormat("BarExporterFull: DONE — %d files, %d total bars exported to MQL5/Files/%s/",
-      totalExported, totalBars, GetExportDir());
+      totalExported, totalBars, g_exportDir);
 
    // Alert user
    Alert(StringFormat("BarExporterFull: exported %d files (%d bars) for %d symbols",
@@ -124,19 +134,14 @@ void OnTimer()
 }
 
 // Export pre-copied rates to CSV — single CopyRates call in caller, no redundant copy
-bool ExportRates(string symbol, ENUM_TIMEFRAMES tf, const MqlRates &rates[], int count)
+bool ExportRates(string symbol, const string tfStr, const MqlRates &rates[], int count, int digits)
 {
-   string tfStr = TFToTerminalString(tf);
-   string filename = GetExportDir() + "/" + symbol + "_" + tfStr + ".csv";
-
-   FolderCreate(GetExportDir(), 0);
+   string filename = g_exportDir + "/" + symbol + "_" + tfStr + ".csv";
 
    int handle = FileOpen(filename, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return false;
 
    FileWrite(handle, "timestamp", "open", "high", "low", "close", "volume");
-
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
    for(int i = 0; i < count; i++)
    {

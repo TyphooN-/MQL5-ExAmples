@@ -23,7 +23,7 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.000"
+#property version   "1.001"
 #property description "Exports bar data for all symbols to CSV for TyphooN-Terminal import."
 #property description "Runs on timer — keeps bars updated for real-time charting."
 #property description "Output: ~/.config/typhoon-terminal/mt5-bars/ (or MQL5/Files/typhoon-bars/)"
@@ -40,6 +40,11 @@ ENUM_TIMEFRAMES g_timeframes[] = {
    PERIOD_MN1, PERIOD_W1, PERIOD_D1, PERIOD_H4, PERIOD_H1,
    PERIOD_M30, PERIOD_M15, PERIOD_M5, PERIOD_M1
 };
+
+// Init-time caches — avoid recomputing constants inside hot export loop.
+string g_exportDir = "";
+string g_tfStrings[];   // parallel to g_timeframes, built once in OnInit
+int    g_tfCount = 0;
 
 // Map MT5 timeframe enum to TyphooN-Terminal timeframe string
 string TFToTerminalString(ENUM_TIMEFRAMES tf)
@@ -59,24 +64,21 @@ string TFToTerminalString(ENUM_TIMEFRAMES tf)
    return "Unknown";
 }
 
-// Get export directory path
-string GetExportDir()
-{
-   if(CustomExportPath != "")
-      return CustomExportPath;
-   return "typhoon-bars";
-}
-
 int OnInit()
 {
-   string dir = GetExportDir();
-   // MQL5 creates subdirectories under MQL5/Files/ automatically
-   PrintFormat("BarExporter v1.000: exporting to MQL5/Files/%s/ every %ds", dir, UpdateIntervalSec);
+   g_exportDir = (CustomExportPath != "") ? CustomExportPath : "typhoon-bars";
+   g_tfCount = ArraySize(g_timeframes);
+   ArrayResize(g_tfStrings, g_tfCount);
+   for(int i = 0; i < g_tfCount; i++)
+      g_tfStrings[i] = TFToTerminalString(g_timeframes[i]);
+   FolderCreate(g_exportDir, 0);
+
+   PrintFormat("BarExporter v1.001: exporting to MQL5/Files/%s/ every %ds", g_exportDir, UpdateIntervalSec);
    PrintFormat("BarExporter: %s symbols, maxBars=%s, overrideCap=%d, %d timeframes",
       MarketWatchOnly ? "Market Watch" : "ALL",
       MaxBars ? "ALL" : "10000",
       MaxBarsOverride,
-      ArraySize(g_timeframes));
+      g_tfCount);
 
    EventSetTimer(UpdateIntervalSec);
 
@@ -95,15 +97,19 @@ void ExportAll()
    int symCount = SymbolsTotal(MarketWatchOnly);
    int exported = 0;
    int errors = 0;
+   datetime nowTs = TimeCurrent();
 
    for(int i = 0; i < symCount; i++)
    {
       string symbol = SymbolName(i, MarketWatchOnly);
       if(StringLen(symbol) == 0) continue;
 
-      for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
+      // Hoist digits: one SymbolInfoInteger call per symbol instead of per (symbol,TF).
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+      for(int tf = 0; tf < g_tfCount; tf++)
       {
-         if(ExportSymbolTF(symbol, g_timeframes[tf]))
+         if(ExportSymbolTF(symbol, g_timeframes[tf], g_tfStrings[tf], digits, nowTs))
             exported++;
          else
             errors++;
@@ -112,15 +118,15 @@ void ExportAll()
 
    // Only log periodically (not every 10s) to avoid spam
    static datetime lastLog = 0;
-   if(TimeCurrent() - lastLog > 300) // log every 5 min
+   if(nowTs - lastLog > 300) // log every 5 min
    {
       PrintFormat("BarExporter: %d symbols × %d TFs = %d exports (%d skipped)",
-         symCount, ArraySize(g_timeframes), exported, errors);
-      lastLog = TimeCurrent();
+         symCount, g_tfCount, exported, errors);
+      lastLog = nowTs;
    }
 }
 
-bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
+bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, const string tfStr, int digits, datetime nowTs)
 {
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
@@ -129,7 +135,7 @@ bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
    if(MaxBars && MaxBarsOverride <= 0)
    {
       // Max history: request from 1970 to now (server returns all available)
-      copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
+      copied = CopyRates(symbol, tf, D'1970.01.01 00:00', nowTs, rates);
    }
    else
    {
@@ -139,30 +145,18 @@ bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf)
    if(copied <= 0) return false;
 
    // Filename: typhoon-bars/EURUSD_1Hour.csv
-   string tfStr = TFToTerminalString(tf);
-   string filename = GetExportDir() + "/" + symbol + "_" + tfStr + ".csv";
+   string filename = g_exportDir + "/" + symbol + "_" + tfStr + ".csv";
 
    int handle = FileOpen(filename, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
-   if(handle == INVALID_HANDLE)
-   {
-      // Try creating subdirectory
-      FolderCreate(GetExportDir(), 0);
-      handle = FileOpen(filename, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
-      if(handle == INVALID_HANDLE) return false;
-   }
+   if(handle == INVALID_HANDLE) return false;
 
    // Header row — matches TyphooN-Terminal Bar struct fields
    FileWrite(handle, "timestamp", "open", "high", "low", "close", "volume");
 
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
    for(int i = 0; i < copied; i++)
    {
-      // Convert MT5 datetime to RFC3339 format: "2026-03-20T16:00:00Z"
-      string ts = FormatRFC3339(rates[i].time);
-
       FileWrite(handle,
-         ts,
+         FormatRFC3339(rates[i].time),
          DoubleToString(rates[i].open, digits),
          DoubleToString(rates[i].high, digits),
          DoubleToString(rates[i].low, digits),
