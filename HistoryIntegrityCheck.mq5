@@ -78,6 +78,13 @@ void OnStart()
          added_symbols[added_count] = symbol;
          added_count++;
       }
+      // Fetch symbol metadata once — used in both no-data and normal paths
+      double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+      string sector = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
+      string industry = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
+      string desc = SymbolInfoString(symbol, SYMBOL_DESCRIPTION);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
       // Request full MN1 history from server
       MqlRates rates[];
       datetime start_time = D'1970.01.01 00:00';
@@ -93,12 +100,6 @@ void OnStart()
       if (bars <= 0)
       {
          symbols_no_data++;
-         // Still record it — 0 bars is useful info
-         string sector = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
-         string industry = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
-         string desc = SymbolInfoString(symbol, SYMBOL_DESCRIPTION);
-         double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-         int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          FileWrite(handle, symbol, "0", "0", "0", "", "",
                    DoubleToString(bid, digits), sector, industry, desc);
          continue;
@@ -112,11 +113,6 @@ void OnStart()
       }
       string earliest = TimeToString(rates[0].time, TIME_DATE);
       string latest = TimeToString(rates[bars - 1].time, TIME_DATE);
-      double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-      string sector = SymbolInfoString(symbol, SYMBOL_SECTOR_NAME);
-      string industry = SymbolInfoString(symbol, SYMBOL_INDUSTRY_NAME);
-      string desc = SymbolInfoString(symbol, SYMBOL_DESCRIPTION);
-      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
       FileWrite(handle, symbol,
                 DoubleToString(ath, digits),
                 DoubleToString(atl, digits),

@@ -39,22 +39,22 @@ input string ForexAPIKey = "https://discord.com/api/webhooks/your_webhook_id/you
 input string IndicesAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string MetalAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
 input string StocksAPIKey = "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token";
-// Symbol-to-sector lookup arrays
-string EnergySymbols[]     = {"USOUSD", "UKOUSD", "NATGAS.f"};
-string CryptoSymbols[]     = {"BTCUSD", "LINKUSD", "BCHUSD", "ETHUSD", "AVAXUSD", "LTCUSD",
-                              "XRPUSD", "MATICUSD", "SOLUSD", "UNIUSD", "ICPUSD", "FILUSD",
-                              "DOTUSD", "DOGEUSD", "VETUSD", "BNBUSD", "TRXUSD", "ADAUSD",
-                              "XLMUSD", "DASHUSD", "XMRUSD"};
-string MetalSymbols[]      = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"};
+// Symbol-to-sector lookup arrays (pre-sorted for O(log n) binary search)
+string EnergySymbols[]     = {"NATGAS.f", "UKOUSD", "USOUSD"};
+string CryptoSymbols[]     = {"ADAUSD", "AVAXUSD", "BCHUSD", "BNBUSD", "BTCUSD", "DASHUSD",
+                              "DOGEUSD", "DOTUSD", "ETHUSD", "FILUSD", "ICPUSD", "LINKUSD",
+                              "LTCUSD", "MATICUSD", "SOLUSD", "TRXUSD", "UNIUSD", "VETUSD",
+                              "XLMUSD", "XMRUSD", "XRPUSD"};
+string MetalSymbols[]      = {"XAGUSD", "XAUUSD", "XPDUSD", "XPTUSD"};
 string ForexSymbols[]      = {"AUDCAD.i", "AUDCHF.i", "AUDJPY.i", "AUDUSD.i", "CADCHF.i", "CADJPY.i", "CHFJPY.i",
                               "EURAUD.i", "EURCAD.i", "EURCHF.i", "EURGBP.i", "EURJPY.i", "EURUSD.i", "GBPAUD.i",
                               "GBPCAD.i", "GBPCHF.i", "GBPJPY.i", "GBPUSD.i", "USDCAD.i", "USDCHF.i", "USDJPY.i"};
-string IndicesSymbols[]    = {"NDX100", "SPX500", "US30", "UK100", "GER30", "ASX200", "SPN35",
-                              "EUSTX50", "FRA40", "JPN225", "HK50", "USDX", "US2000.cash", "USTN10.f"};
-string AgricultureSymbols[]= {"CORN.c", "COCOA.c", "COFFEE.c", "SOYBEAN.c", "WHEAT.c"};
-string StocksSymbols[]     = {"AAPL", "AMZN", "BABA", "BAC", "GOOG", "META", "MSFT",
-                              "NFLX", "NVDA", "PFE", "RACE", "T", "TSLA", "V", "WMT",
-                              "ZM", "ALVG", "BAYGn", "AIRF", "DBKGn", "VOWG_p", "IBE", "LVMH"};
+string IndicesSymbols[]    = {"ASX200", "EUSTX50", "FRA40", "GER30", "HK50", "JPN225", "NDX100",
+                              "SPN35", "SPX500", "UK100", "US2000.cash", "US30", "USDX", "USTN10.f"};
+string AgricultureSymbols[]= {"COCOA.c", "COFFEE.c", "CORN.c", "SOYBEAN.c", "WHEAT.c"};
+string StocksSymbols[]     = {"AAPL", "AIRF", "ALVG", "AMZN", "BABA", "BAC", "BAYGn",
+                              "DBKGn", "GOOG", "IBE", "LVMH", "META", "MSFT", "NFLX",
+                              "NVDA", "PFE", "RACE", "T", "TSLA", "V", "VOWG_p", "WMT", "ZM"};
 int OnInit()
 {
    g_cachedWebhookURL = GetWebhookURL();
@@ -62,21 +62,28 @@ int OnInit()
       PrintFormat("Discord: WARNING — %s not mapped to any sector webhook, notifications disabled", _Symbol);
    return(INIT_SUCCEEDED);
 }
-bool IsSymbolInArray(const string &arr[], string sym)
+bool IsSymbolInSorted(const string &arr[], string sym)
 {
-   for(int i = 0; i < ArraySize(arr); i++)
-      if(arr[i] == sym) return true;
+   int lo = 0, hi = ArraySize(arr) - 1;
+   while(lo <= hi)
+   {
+      int mid = (lo + hi) / 2;
+      int cmp = StringCompare(arr[mid], sym);
+      if(cmp == 0) return true;
+      if(cmp < 0) lo = mid + 1;
+      else hi = mid - 1;
+   }
    return false;
 }
 string GetWebhookURL()
 {
-   if(IsSymbolInArray(EnergySymbols, _Symbol))      return EnergyAPIKey;
-   if(IsSymbolInArray(CryptoSymbols, _Symbol))      return CryptoAPIKey;
-   if(IsSymbolInArray(MetalSymbols, _Symbol))       return MetalAPIKey;
-   if(IsSymbolInArray(ForexSymbols, _Symbol))       return ForexAPIKey;
-   if(IsSymbolInArray(IndicesSymbols, _Symbol))     return IndicesAPIKey;
-   if(IsSymbolInArray(AgricultureSymbols, _Symbol)) return AgricultureAPIKey;
-   if(IsSymbolInArray(StocksSymbols, _Symbol))      return StocksAPIKey;
+   if(IsSymbolInSorted(EnergySymbols, _Symbol))      return EnergyAPIKey;
+   if(IsSymbolInSorted(CryptoSymbols, _Symbol))      return CryptoAPIKey;
+   if(IsSymbolInSorted(MetalSymbols, _Symbol))       return MetalAPIKey;
+   if(IsSymbolInSorted(ForexSymbols, _Symbol))       return ForexAPIKey;
+   if(IsSymbolInSorted(IndicesSymbols, _Symbol))     return IndicesAPIKey;
+   if(IsSymbolInSorted(AgricultureSymbols, _Symbol)) return AgricultureAPIKey;
+   if(IsSymbolInSorted(StocksSymbols, _Symbol))      return StocksAPIKey;
    return "";
 }
 bool ReadAndVerifyPower(double &bullHTF, double &bearHTF, double &bullLTF, double &bearLTF)

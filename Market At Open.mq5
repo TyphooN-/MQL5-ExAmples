@@ -93,20 +93,16 @@ double CalculateATR(int period)
 //+------------------------------------------------------------------+
 //| Validate stop loss and take profit prices                        |
 //+------------------------------------------------------------------+
-bool IsStopLossValid(double price, double stopLoss, bool isBuy)
+bool IsStopLossValid(double price, double stopLoss, bool isBuy, double stopLevel)
 {
-   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-
    if (isBuy)
       return (stopLoss < price && (price - stopLoss) >= stopLevel);
    else
       return (stopLoss > price && (stopLoss - price) >= stopLevel);
 }
 
-bool IsTakeProfitValid(double price, double takeProfit, bool isBuy)
+bool IsTakeProfitValid(double price, double takeProfit, bool isBuy, double stopLevel)
 {
-   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-
    if (isBuy)
       return (takeProfit > price && (takeProfit - price) >= stopLevel);
    else
@@ -125,19 +121,20 @@ void PlaceMarketOrder()
    double price = isBuy ? ask : bid;
 
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    double sl = NormalizeDouble(StopLossPrice, digits);
    double tp = NormalizeDouble(TakeProfitPrice, digits);
 
-   if (!IsStopLossValid(price, sl, isBuy) && StopLossATR > 0)
+   if (!IsStopLossValid(price, sl, isBuy, stopLevel) && StopLossATR > 0)
    {
       sl = NormalizeDouble(isBuy ? price - (atr * StopLossATR) : price + (atr * StopLossATR), digits);
-      if (!IsStopLossValid(price, sl, isBuy)) sl = 0;
+      if (!IsStopLossValid(price, sl, isBuy, stopLevel)) sl = 0;
    }
 
-   if (!IsTakeProfitValid(price, tp, isBuy) && TakeProfitATR > 0)
+   if (!IsTakeProfitValid(price, tp, isBuy, stopLevel) && TakeProfitATR > 0)
    {
       tp = NormalizeDouble(isBuy ? price + (atr * TakeProfitATR) : price - (atr * TakeProfitATR), digits);
-      if (!IsTakeProfitValid(price, tp, isBuy)) tp = 0;
+      if (!IsTakeProfitValid(price, tp, isBuy, stopLevel)) tp = 0;
    }
 
    if (isBuy)

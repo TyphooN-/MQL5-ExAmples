@@ -57,6 +57,7 @@ void ScanSwaps()
 {
    int total = SymbolsTotal(false);
    SwapEntry entries[];
+   ArrayResize(entries, 0, total);  // Pre-allocate reserve — avoids O(n) realloc per element
    int count = 0;
 
    Print("=== SWAPHARVEST ===");
@@ -106,19 +107,29 @@ void ScanSwaps()
          entries[idx].direction = "SHORT";
    }
 
-   // Sort by best swap value descending (use max of positive long/short)
+   // Pre-cache sort keys — avoids recomputing MathMax inside O(n²) sort loop
+   double sortKeys[];
+   ArrayResize(sortKeys, count);
+   for (int i = 0; i < count; i++)
+      sortKeys[i] = MathMax(entries[i].swap_long, entries[i].swap_short);
+
+   // Selection sort descending (n < 200, acceptable for cold path)
    for (int i = 0; i < count - 1; i++)
    {
+      int best = i;
       for (int j = i + 1; j < count; j++)
       {
-         double best_i = MathMax(entries[i].swap_long, entries[i].swap_short);
-         double best_j = MathMax(entries[j].swap_long, entries[j].swap_short);
-         if (best_j > best_i)
-         {
-            SwapEntry tmp = entries[i];
-            entries[i] = entries[j];
-            entries[j] = tmp;
-         }
+         if (sortKeys[j] > sortKeys[best])
+            best = j;
+      }
+      if (best != i)
+      {
+         SwapEntry tmp = entries[i];
+         entries[i] = entries[best];
+         entries[best] = tmp;
+         double tmpKey = sortKeys[i];
+         sortKeys[i] = sortKeys[best];
+         sortKeys[best] = tmpKey;
       }
    }
 

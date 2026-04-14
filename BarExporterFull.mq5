@@ -98,12 +98,13 @@ void OnTimer()
 
       for(int tf = 0; tf < ArraySize(g_timeframes); tf++)
       {
-         // Step 1: Force download full history from broker
-         int bars = DownloadHistory(symbol, g_timeframes[tf]);
+         // Download full history and export in one pass — avoids redundant CopyRates
+         MqlRates rates[];
+         ArraySetAsSeries(rates, false);
+         int bars = CopyRates(symbol, g_timeframes[tf], D'1970.01.01 00:00', TimeCurrent(), rates);
          if(bars <= 0) continue;
 
-         // Step 2: Export to CSV
-         if(ExportSymbolTF(symbol, g_timeframes[tf], bars))
+         if(ExportRates(symbol, g_timeframes[tf], rates, bars))
          {
             totalExported++;
             totalBars += bars;
@@ -122,38 +123,12 @@ void OnTimer()
       totalExported, totalBars, symCount));
 }
 
-// Download full history from broker (1970 to now)
-int DownloadHistory(string symbol, ENUM_TIMEFRAMES tf)
+// Export pre-copied rates to CSV — single CopyRates call in caller, no redundant copy
+bool ExportRates(string symbol, ENUM_TIMEFRAMES tf, const MqlRates &rates[], int count)
 {
-   MqlRates rates[];
-   ArraySetAsSeries(rates, false);
-
-   datetime start_time = D'1970.01.01 00:00';
-   datetime end_time = TimeCurrent();
-
-   // CopyRates with full date range triggers MT5 to download from server
-   int bars = CopyRates(symbol, tf, start_time, end_time, rates);
-   return bars;
-}
-
-bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int barCount)
-{
-   MqlRates rates[];
-   ArraySetAsSeries(rates, false);
-
-   // Re-copy full range after download (date range captures more than position-based copy)
-   int copied = CopyRates(symbol, tf, D'1970.01.01 00:00', TimeCurrent(), rates);
-   if(copied <= 0)
-   {
-      PrintFormat("  ExportSymbolTF: CopyRates failed for %s %s (error %d)",
-         symbol, TFToTerminalString(tf), GetLastError());
-      return false;
-   }
-
    string tfStr = TFToTerminalString(tf);
    string filename = GetExportDir() + "/" + symbol + "_" + tfStr + ".csv";
 
-   // Create directory
    FolderCreate(GetExportDir(), 0);
 
    int handle = FileOpen(filename, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
@@ -163,7 +138,7 @@ bool ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int barCount)
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
-   for(int i = 0; i < copied; i++)
+   for(int i = 0; i < count; i++)
    {
       FileWrite(handle,
          FormatRFC3339(rates[i].time),

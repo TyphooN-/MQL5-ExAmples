@@ -203,7 +203,10 @@ void ExportSymbolsToCSV()
 }
 string GetTradeSessions(string symbol)
 {
-   string result = "";
+   // Collect session strings first, join once — avoids O(n²) string concat
+   string parts[];
+   int partCount = 0;
+   ArrayResize(parts, 0, 21); // max 7 days × 3 sessions
    for(int day=0; day<7; day++)
    {
       for(int session=0; session<3; session++)
@@ -213,11 +216,28 @@ string GetTradeSessions(string symbol)
          {
             if(open_time != 0 && close_time != 0)
             {
-               result += StringFormat("%s-%s ", TimeToString(open_time, TIME_MINUTES), TimeToString(close_time, TIME_MINUTES));
+               int idx = partCount++;
+               ArrayResize(parts, partCount);
+               parts[idx] = TimeToString(open_time, TIME_MINUTES) + "-" + TimeToString(close_time, TIME_MINUTES);
             }
          }
       }
    }
-   StringTrimRight(result);
-   return result;
+   if(partCount == 0) return "";
+   // Single join pass via uchar buffer
+   int totalLen = 0;
+   for(int i = 0; i < partCount; i++)
+      totalLen += StringLen(parts[i]) + 1; // +1 for space separator
+   uchar buf[];
+   ArrayResize(buf, totalLen);
+   int pos = 0;
+   for(int i = 0; i < partCount; i++)
+   {
+      if(i > 0) buf[pos++] = ' ';
+      uchar partBytes[];
+      int len = StringToCharArray(parts[i], partBytes, 0, -1, CP_UTF8) - 1;
+      ArrayCopy(buf, partBytes, pos, 0, len);
+      pos += len;
+   }
+   return CharArrayToString(buf, 0, pos, CP_UTF8);
 }
