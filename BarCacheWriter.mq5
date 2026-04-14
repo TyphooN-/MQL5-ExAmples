@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.445"
+#property version   "1.446"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.446: Thread cached tfStr/tfPeriod into ExportSymbolTF/IncrementalExportSymbolTF — eliminates last TFToStr()/PeriodSeconds() calls from hot path."
 #property description "v1.445: Cache TF periods (7659 PeriodSeconds calls/cycle → 0), cache g_tfCount, consolidate TimeCurrent() calls in ExportAll."
 #property description "v1.444: Fix specs CSV buffer overflow on non-ASCII descriptions (e.g. USDMXN's 'México' expands in UTF-8) — measure byte length, not char count."
 #property description "v1.443: Deeper Wine-overhead pass — O(1) demand bitmap, track-time dirty flag bulk flush (10× fewer bar_track writes), skip redundant specs DB writes."
@@ -752,7 +753,7 @@ int OnInit()
             {
                // Cap bars during integrity — full history fills via incremental 30s cycle
                int maxBars = MathMin(MaxBarsForTF(enumTf), InitialBarCap);
-               int bars = ExportSymbolTF(sym, enumTf, maxBars);
+               int bars = ExportSymbolTF(sym, enumTf, maxBars, g_tfStrings[ti]);
                if(bars > 0)
                {
                   reExportCount++;
@@ -787,7 +788,7 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.445: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
+   PrintFormat("BarCacheWriter v1.446: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -960,7 +961,7 @@ void ExportAll()
             }
             // Unlimited: maxBars=0 fetches ALL available history from server
             // Monitor MT5 memory if OOM occurs on M1 with millions of bars
-            int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]));
+            int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]), g_tfStrings[tf]);
 
             if(bars > 0)
             {
@@ -998,7 +999,7 @@ void ExportAll()
          // Incremental sync: only fetch bars SINCE last sync, merge with existing DB blob.
          // Instead of re-exporting 100K bars, fetches ~200 recent bars and appends to existing data.
          // Preserves full history while only transferring the delta.
-         int bars = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx]);
+         int bars = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
          if(bars > 0)
          {
             exported++;
@@ -1335,11 +1336,10 @@ void ReadRaw8(const uchar &buf[], int off, ByteConv &bc)
 // v1.427-v1.429 used SQL SUBSTR/BLOB UPDATE which corrupted data due to MQL5's
 // DatabaseBindArray binding uchar[] as TEXT — SUBSTR on TEXT uses character offsets
 // not byte offsets, producing truncated output (110 bytes instead of megabytes).
-int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSyncTime)
+int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSyncTime, const string &tfStr, int tfPeriod)
 {
-   int tfSeconds = PeriodSeconds(tf);
    int elapsed = (int)(TimeCurrent() - lastSyncTime);
-   int estimatedNewBars = (tfSeconds > 0) ? (elapsed / tfSeconds) + 2 : 10;
+   int estimatedNewBars = (tfPeriod > 0) ? (elapsed / tfPeriod) + 2 : 10;
    int fetchCount = MathMax(3, MathMin(estimatedNewBars, 200));
 
    MqlRates newRates[];
@@ -1347,10 +1347,10 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    int newCopied = CopyRates(symbol, tf, 0, fetchCount, newRates);
    if(newCopied <= 0) return 0;
 
-   string key = "mt5:" + symbol + ":" + TFToStr(tf);
+   string key = "mt5:" + symbol + ":" + tfStr;
 
    // Read existing blob from DB via pre-prepared statement
-   if(g_stmtBarRead == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0);
+   if(g_stmtBarRead == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0, tfStr);
    DatabaseReset(g_stmtBarRead);
    DatabaseBind(g_stmtBarRead, 0, key);
    uchar existingBlob[];
@@ -1362,11 +1362,11 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    }
 
    if(!hasExisting)
-      return ExportSymbolTF(symbol, tf, 0);
+      return ExportSymbolTF(symbol, tf, 0, tfStr);
 
    // Verify TTBR magic
    if(existingBlob[0] != 'T' || existingBlob[1] != 'T' || existingBlob[2] != 'B' || existingBlob[3] != 'R')
-      return ExportSymbolTF(symbol, tf, 0);
+      return ExportSymbolTF(symbol, tf, 0, tfStr);
 
    int existingCount = (int)existingBlob[4]
                      | ((int)existingBlob[5] << 8)
@@ -1374,7 +1374,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
                      | ((int)existingBlob[7] << 24);
 
    if(existingCount <= 0 || ArraySize(existingBlob) < 8 + existingCount * 48)
-      return ExportSymbolTF(symbol, tf, 0);
+      return ExportSymbolTF(symbol, tf, 0, tfStr);
 
    // Find last existing bar timestamp
    ByteConv bc;
@@ -1421,7 +1421,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
 
    // Bar cap: if exceeded, do full re-export capped at MAX_BARS_PER_KEY
    if(mergedCount > MAX_BARS_PER_KEY)
-      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY);
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
 
    // Build merged blob in memory
    int mergedBytes = 8 + mergedCount * 48;
@@ -1472,7 +1472,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    return mergedCount;
 }
 
-int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
+int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars, const string &tfStr)
 {
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
@@ -1490,7 +1490,7 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
       if(copyFailLog < 20)
       {
          PrintFormat("  CopyRates FAIL: %s %s maxBars=%d err=%d",
-            symbol, TFToStr(tf), maxBars, GetLastError());
+            symbol, tfStr, maxBars, GetLastError());
          copyFailLog++;
       }
       return 0;
@@ -1500,7 +1500,7 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars)
    uchar buffer[];
    PackBarsBinary(rates, 0, copied, buffer);
 
-   string key = "mt5:" + symbol + ":" + TFToStr(tf);
+   string key = "mt5:" + symbol + ":" + tfStr;
 
    // Use pre-prepared statement (reset+rebind is ~10× faster than prepare+finalize per call)
    int req = g_stmtBarInsert;
