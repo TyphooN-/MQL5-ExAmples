@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.446"
+#property version   "1.447"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.447: Heartbeat row (mt5:__HEARTBEAT__:{accountId}) + initial-burst mode — on cold start (empty /dev/shm) process demand symbols sequentially with no rotation / TF gating until cache is warm. Terminal can detect staleness via heartbeat."
 #property description "v1.446: Thread cached tfStr/tfPeriod into ExportSymbolTF/IncrementalExportSymbolTF — eliminates last TFToStr()/PeriodSeconds() calls from hot path."
 #property description "v1.445: Cache TF periods (7659 PeriodSeconds calls/cycle → 0), cache g_tfCount, consolidate TimeCurrent() calls in ExportAll."
 #property description "v1.444: Fix specs CSV buffer overflow on non-ASCII descriptions (e.g. USDMXN's 'México' expands in UTF-8) — measure byte length, not char count."
@@ -58,6 +59,29 @@ datetime g_specsLastDbWrite = 0;             // v1.443: When specs CSV was last 
 string g_demandSymbols[];     // flat symbol list (sorted for binary search)
 int g_demandCount = 0;
 
+// v1.447: Promote v2 per-symbol:TF last-seen timestamps to globals so both
+// startup integrity and the ExportAll hot loop can consult them. The terminal
+// writes these to tell us "I already have data up to LAST_TS, skip older bars."
+string   g_demandV2Keys[];        // "SYMBOL:TF" e.g. "EURUSD:1Hour"
+datetime g_demandV2Timestamps[];  // LAST_TS in seconds
+int      g_demandV2Count = 0;
+
+// v1.447: v3 gap-fill requests — SYMBOL:TF:LAST_TS:MAX_BARS (4 colons).
+// When MAX_BARS > 0, the EA force-exports that many bars from the broker
+// regardless of track state, overriding the normal incremental path. Used by
+// the terminal when it detects a gap on chart load (expected last-bar time
+// is older than actual). Entries are consumed once: on successful export the
+// corresponding MAX_BARS is zeroed so the request is not re-served next cycle.
+string   g_gapFillKeys[];
+long     g_gapFillLastTs[];   // ms
+int      g_gapFillMaxBars[];
+int      g_gapFillCount = 0;
+
+// v1.447: Re-read demand.txt when its mtime changes so gap-fill requests
+// written after OnInit get picked up without an EA restart.
+string   g_demandFilePath  = "";     // resolved at first load (account tag vs fallback)
+datetime g_demandFileMtime = 0;      // last-seen file modification time
+
 // v1.443 perf: O(1) demand-symbol membership check. Parallel array indexed by
 // the MT5 symbol index (SymbolName(i, MarketWatchOnly)). Rebuilt once at OnInit
 // after demand.txt is loaded, and on symCount change if detected. Replaces
@@ -90,6 +114,20 @@ int g_cycleCount = 0;           // Counts ExportAll() calls for periodic mainten
 // Per-TF last export time — skip TFs that can't have new bars since last check.
 // E.g., H4 bars only change every 4 hours, no point checking every 30 seconds.
 datetime g_tfLastExportTime[9]; // indexed by g_timeframes[] order
+
+// v1.447: Initial-burst mode — after /dev/shm clear or fresh install, rotation
+// would leave most symbols unpopulated for ~4 minutes. When OnInit detects an
+// empty or near-empty DB, we flip this flag to process demand symbols
+// sequentially at max speed (bypassing rotation + TF gating) until the cache
+// is warm. Exit when all demand symbols have at least one populated TF.
+bool     g_initBurstActive     = false;
+int      g_initBurstCycles     = 0;    // cycles spent in burst (log context)
+int      g_initBurstExitThresh = 100;  // min bars per demand:TF to count "populated"
+
+// v1.447: Heartbeat — written at end of every ExportAll cycle so the terminal
+// can see writer liveness without parsing log files. Key is
+// `mt5:__HEARTBEAT__:{accountId}` stored as JSON text in bar_cache.data.
+datetime g_lastHeartbeatWrite = 0;
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
@@ -459,6 +497,272 @@ void LoadTrackingFromDB()
    }
 }
 
+// v1.447: Look up a pending gap-fill request. Returns MAX_BARS if a request
+// is outstanding for this symbol:TF, 0 otherwise. O(gapCount) — gap list is
+// expected to be small (a handful on chart opens), linear scan is fine.
+int GetGapFillMaxBars(string symTf)
+{
+   for(int i = 0; i < g_gapFillCount; i++)
+   {
+      if(g_gapFillKeys[i] == symTf && g_gapFillMaxBars[i] > 0)
+         return g_gapFillMaxBars[i];
+   }
+   return 0;
+}
+
+// v1.447: Mark a gap-fill request as served so it isn't re-processed next
+// cycle. Called after a successful ExportSymbolTF on a gap-fill key.
+void ClearGapFill(string symTf)
+{
+   for(int i = 0; i < g_gapFillCount; i++)
+   {
+      if(g_gapFillKeys[i] == symTf)
+      {
+         g_gapFillMaxBars[i] = 0;
+         return;
+      }
+   }
+}
+
+// v1.447: Shared demand.txt loader — parses v1 (plain symbol), v2
+// (SYMBOL:TF:LAST_TS) and v3 (SYMBOL:TF:LAST_TS:MAX_BARS) entries. Called
+// from OnInit once and from ExportAll whenever the demand file's mtime
+// changes. Rebuilds g_demandSymbols, g_demandV2*, g_gapFill* globals from
+// scratch — no incremental merging, keeps semantics simple.
+void LoadDemandFile(int symCount)
+{
+   // Clear previous state.
+   g_demandCount = 0;
+   g_demandV2Count = 0;
+   g_gapFillCount = 0;
+   ArrayResize(g_demandSymbols, 100);
+   ArrayResize(g_demandV2Keys, 100);
+   ArrayResize(g_demandV2Timestamps, 100);
+   ArrayResize(g_gapFillKeys, 16);
+   ArrayResize(g_gapFillLastTs, 16);
+   ArrayResize(g_gapFillMaxBars, 16);
+
+   string path = g_accountTag + "_demand.txt";
+   int h = FileOpen(path, FILE_READ | FILE_ANSI | FILE_COMMON);
+   if(h == INVALID_HANDLE)
+   {
+      path = "demand.txt";
+      h = FileOpen(path, FILE_READ | FILE_ANSI | FILE_COMMON);
+   }
+   if(h == INVALID_HANDLE)
+   {
+      g_demandFilePath = "";
+      g_demandFileMtime = 0;
+      return;
+   }
+
+   while(!FileIsEnding(h))
+   {
+      string line = FileReadString(h);
+      StringTrimRight(line);
+      StringTrimLeft(line);
+      if(StringLen(line) == 0 || StringGetCharacter(line, 0) == '#') continue;
+
+      string parts[];
+      int nParts = StringSplit(line, ':', parts);
+      if(nParts == 4)
+      {
+         // v3 gap-fill: SYMBOL:TF:LAST_TS_MS:MAX_BARS
+         string symTf = parts[0] + ":" + parts[1];
+         long tsMs    = StringToInteger(parts[2]);
+         int maxBars  = (int)StringToInteger(parts[3]);
+         if(g_gapFillCount >= ArraySize(g_gapFillKeys))
+         {
+            int ng = g_gapFillCount * 2 + 1;
+            ArrayResize(g_gapFillKeys, ng);
+            ArrayResize(g_gapFillLastTs, ng);
+            ArrayResize(g_gapFillMaxBars, ng);
+         }
+         g_gapFillKeys[g_gapFillCount]    = symTf;
+         g_gapFillLastTs[g_gapFillCount]  = tsMs;
+         g_gapFillMaxBars[g_gapFillCount] = maxBars;
+         g_gapFillCount++;
+         // Still add to flat symbol list so rotation includes it.
+         if(g_demandCount >= ArraySize(g_demandSymbols))
+            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+         g_demandSymbols[g_demandCount] = parts[0];
+         g_demandCount++;
+      }
+      else if(nParts == 3)
+      {
+         // v2 timestamped demand.
+         string symTf = parts[0] + ":" + parts[1];
+         long tsMs = StringToInteger(parts[2]);
+         datetime ts = (datetime)(tsMs / 1000);
+         if(g_demandV2Count >= ArraySize(g_demandV2Keys))
+         {
+            int nv = g_demandV2Count * 2 + 1;
+            ArrayResize(g_demandV2Keys, nv);
+            ArrayResize(g_demandV2Timestamps, nv);
+         }
+         g_demandV2Keys[g_demandV2Count]       = symTf;
+         g_demandV2Timestamps[g_demandV2Count] = ts;
+         g_demandV2Count++;
+         if(g_demandCount >= ArraySize(g_demandSymbols))
+            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+         g_demandSymbols[g_demandCount] = parts[0];
+         g_demandCount++;
+      }
+      else if(nParts == 1 && StringLen(line) > 0)
+      {
+         // v1 bare symbol.
+         if(g_demandCount >= ArraySize(g_demandSymbols))
+            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+         g_demandSymbols[g_demandCount] = line;
+         g_demandCount++;
+      }
+   }
+   FileClose(h);
+
+   // Sort + dedup symbols for O(log n) lookup.
+   if(g_demandCount > 1)
+   {
+      for(int si = 1; si < g_demandCount; si++)
+      {
+         string tmp = g_demandSymbols[si];
+         int sj = si - 1;
+         while(sj >= 0 && StringCompare(g_demandSymbols[sj], tmp) > 0)
+         {
+            g_demandSymbols[sj + 1] = g_demandSymbols[sj];
+            sj--;
+         }
+         g_demandSymbols[sj + 1] = tmp;
+      }
+      int unique = 1;
+      for(int si = 1; si < g_demandCount; si++)
+      {
+         if(g_demandSymbols[si] != g_demandSymbols[unique - 1])
+            g_demandSymbols[unique++] = g_demandSymbols[si];
+      }
+      g_demandCount = unique;
+   }
+
+   RebuildDemandIndexBitmap(symCount);
+
+   // Remember file path + mtime for change detection.
+   g_demandFilePath = path;
+   // MQL5 FileOpen does not expose mtime directly — we use the combined bar
+   // of g_demandCount+g_gapFillCount+modTime approach: check via FileTime on
+   // reopen. Store TimeCurrent() as a pseudo-mtime so we refresh at most every
+   // DEMAND_REFRESH_SEC window.
+   g_demandFileMtime = TimeCurrent();
+
+   PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d v2 entries, %d v3 gap-fills",
+      g_demandCount, g_demandV2Count, g_gapFillCount);
+}
+
+// v1.447: Decide whether to enter initial-burst mode.
+// Returns true if the cache appears empty/near-empty for this account —
+// the rotation logic would otherwise leave most demand symbols unpopulated
+// for minutes after /dev/shm clear. Burst mode bypasses rotation and
+// TF gating so demand symbols get filled sequentially at max speed.
+//
+// Heuristic: if fewer than 20% of (demandCount × tfCount) bar_cache rows
+// exist with bar_count >= g_initBurstExitThresh, we're in a cold-start
+// state. No demand list → check overall row count as proxy.
+bool ShouldEnterInitialBurst()
+{
+   if(g_db == INVALID_HANDLE) return false;
+
+   int req = DatabasePrepare(g_db,
+      "SELECT COUNT(*) FROM bar_cache WHERE bar_count >= 100");
+   if(req == INVALID_HANDLE) return false;
+   long populated = 0;
+   if(DatabaseRead(req))
+      DatabaseColumnLong(req, 0, populated);
+   DatabaseFinalize(req);
+
+   if(g_demandCount > 0)
+   {
+      int expected = g_demandCount * g_tfCount;
+      int floor    = (int)(expected * 0.20);
+      if(populated < floor)
+      {
+         PrintFormat("BarCacheWriter: cold start — %I64d/%d populated keys < 20%% floor (%d); entering initial-burst mode",
+            populated, expected, floor);
+         return true;
+      }
+   }
+   else
+   {
+      // No demand list — use absolute floor. 9 TFs × ~50 symbols = 450 keys
+      // is a reasonable warm threshold for generic installs.
+      if(populated < 450)
+      {
+         PrintFormat("BarCacheWriter: cold start — %I64d populated keys < 450; entering initial-burst mode",
+            populated);
+         return true;
+      }
+   }
+   return false;
+}
+
+// v1.447: Exit initial-burst when every demand symbol has at least one TF
+// populated with >= g_initBurstExitThresh bars. Called cheaply (once/cycle)
+// from ExportAll. Uses in-memory g_trackTimes — no DB query.
+bool CanExitInitialBurst()
+{
+   if(g_demandCount == 0) return true;  // nothing to track → always ok
+
+   // For each demand symbol, confirm at least one of its TFs has progressed
+   // past the "never synced" state (g_trackTimes > 0 and != FAIL_SENTINEL).
+   for(int s = 0; s < g_demandCount; s++)
+   {
+      bool anyReady = false;
+      for(int t = 0; t < g_tfCount; t++)
+      {
+         string tk = g_demandSymbols[s] + ":" + g_tfStrings[t];
+         // Linear scan of track arrays — g_demandCount is small (~50-100),
+         // g_tfCount=9, runs once per cycle, O(demand × tf × track) is fine.
+         for(int i = 0; i < g_trackCount; i++)
+         {
+            if(g_trackKeys[i] == tk
+               && g_trackTimes[i] > 0
+               && g_trackTimes[i] != (datetime)FAIL_SENTINEL)
+            {
+               anyReady = true;
+               break;
+            }
+         }
+         if(anyReady) break;
+      }
+      if(!anyReady) return false;  // this symbol has no populated TF yet
+   }
+   return true;
+}
+
+// v1.447: Write a heartbeat row so the terminal can detect liveness.
+// JSON payload: {ts, rotation_offset, sym_count, cycle_ms, init_burst,
+//                symbols_ready, cycle_count}
+void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exportedCount, int skippedCount)
+{
+   if(g_stmtMetaInsert == INVALID_HANDLE) return;
+   datetime now = TimeCurrent();
+   string key = "mt5:__HEARTBEAT__:" + g_accountTag;
+   string json = StringFormat(
+      "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
+      "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
+      "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
+      "\"version\":\"1.447\"}",
+      (long)now, rotationOffset, symCount, cycleMs,
+      g_initBurstActive ? "true" : "false",
+      g_initBurstCycles, g_cycleCount,
+      exportedCount, skippedCount, g_trackCount, g_demandCount);
+
+   DatabaseReset(g_stmtMetaInsert);
+   DatabaseBind(g_stmtMetaInsert, 0, key);
+   DatabaseBind(g_stmtMetaInsert, 1, json);
+   DatabaseBind(g_stmtMetaInsert, 2, (long)now);
+   DatabaseBind(g_stmtMetaInsert, 3, 0);
+   DatabaseRead(g_stmtMetaInsert);
+   g_lastHeartbeatWrite = now;
+}
+
 int OnInit()
 {
    // Opens typhoon_mt5_cache.db in MQL5/Files/ sandbox.
@@ -615,95 +919,8 @@ int OnInit()
       #define INTEGRITY_BATCH_SIZE 20  // Commit every N symbols to release memory
       // Use configurable InitialBarCap (default 1000) — incremental sync fills the rest
 
-      // Read demand list from TyphooN-Terminal (if present)
-      // demand.txt v2: SYMBOL:TF:LAST_TS format (lines starting with # are comments)
-      // v1 compat: plain symbol names (no colons) are treated as "all TFs, full export"
-      // Use global g_demandSymbols / g_demandCount (shared with ExportAll)
-      ArrayResize(g_demandSymbols, 100);  // Pre-allocate to avoid quadratic resize
-      g_demandCount = 0;
-      // v2: per-symbol:TF last timestamp — only export bars AFTER this time
-      string demandKeys[];       // "EURUSD:1Hour"
-      datetime demandTimestamps[];  // last known timestamp
-      ArrayResize(demandKeys, 100);
-      ArrayResize(demandTimestamps, 100);
-      int demandV2Count = 0;
-
-      string demandFile = g_accountTag + "_demand.txt";
-      int demandHandle = FileOpen(demandFile, FILE_READ | FILE_ANSI | FILE_COMMON);
-      if(demandHandle == INVALID_HANDLE)
-         demandHandle = FileOpen("demand.txt", FILE_READ | FILE_ANSI | FILE_COMMON);
-      if(demandHandle != INVALID_HANDLE)
-      {
-         while(!FileIsEnding(demandHandle))
-         {
-            string line = FileReadString(demandHandle);
-            StringTrimRight(line);
-            StringTrimLeft(line);
-            if(StringLen(line) == 0 || StringGetCharacter(line, 0) == '#') continue; // skip empty/comments
-
-            // v2 format: SYMBOL:TF:TIMESTAMP (3 colons)
-            string parts[];
-            int nParts = StringSplit(line, ':', parts);
-            if(nParts == 3)
-            {
-               // v2 entry: EURUSD:1Hour:1743897600000
-               string symTf = parts[0] + ":" + parts[1];
-               long tsMs = StringToInteger(parts[2]);
-               datetime ts = (datetime)(tsMs / 1000);
-               if(demandV2Count >= ArraySize(demandKeys))
-               {
-                  ArrayResize(demandKeys, demandV2Count * 2 + 1);
-                  ArrayResize(demandTimestamps, demandV2Count * 2 + 1);
-               }
-               demandKeys[demandV2Count] = symTf;
-               demandTimestamps[demandV2Count] = ts;
-               demandV2Count++;
-               // Also add symbol to flat list for v1 compat matching
-               // Dedup via sorted insert position check — O(log n) vs O(n) linear scan
-               if(g_demandCount >= ArraySize(g_demandSymbols))
-                  ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-               g_demandSymbols[g_demandCount] = parts[0];
-               g_demandCount++;
-            }
-            else if(nParts == 1)
-            {
-               // v1 format: plain symbol name
-               if(g_demandCount >= ArraySize(g_demandSymbols))
-                  ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-               g_demandSymbols[g_demandCount] = line;
-               g_demandCount++;
-            }
-         }
-         FileClose(demandHandle);
-         // Sort demand symbols for O(log n) binary search in main loop
-         if(g_demandCount > 1)
-         {
-            // Simple insertion sort on small array
-            for(int si = 1; si < g_demandCount; si++)
-            {
-               string tmp = g_demandSymbols[si];
-               int sj = si - 1;
-               while(sj >= 0 && StringCompare(g_demandSymbols[sj], tmp) > 0)
-               {
-                  g_demandSymbols[sj + 1] = g_demandSymbols[sj];
-                  sj--;
-               }
-               g_demandSymbols[sj + 1] = tmp;
-            }
-            // O(n) dedup on sorted array — removes adjacent duplicates from v2 multi-TF entries
-            int unique = 1;
-            for(int si = 1; si < g_demandCount; si++)
-            {
-               if(g_demandSymbols[si] != g_demandSymbols[unique - 1])
-                  g_demandSymbols[unique++] = g_demandSymbols[si];
-            }
-            g_demandCount = unique;
-         }
-         // Demand array is now sorted — all lookups use O(log n) binary search
-         PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols (sorted), %d v2 entries", g_demandCount, demandV2Count);
-      }
-      // v1.443: Build the O(1) demand bitmap once now that the sorted list is ready.
-      RebuildDemandIndexBitmap(symCount);
+      // v1.447: Shared demand.txt loader — handles v1/v2/v3 formats.
+      LoadDemandFile(symCount);
 
       int batchCount = 0;
       SafeBegin();
@@ -788,11 +1005,21 @@ int OnInit()
          checkedCount, reExportCount, totalReExportedBars, intElapsed, g_demandCount);
    }
 
-   PrintFormat("BarCacheWriter v1.446: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d",
+   // v1.447: Activate initial-burst if the cache looks cold. Must run AFTER
+   // demand.txt load (done inside IntegrityCheck block above) so g_demandCount
+   // reflects terminal priorities. IntegrityCheck already exports demand
+   // symbols up to InitialBarCap bars — burst mode kicks in on subsequent
+   // OnTimer calls to keep rotating through at max speed until the rest of
+   // watched symbols are warm.
+   g_initBurstActive = ShouldEnterInitialBurst();
+   g_initBurstCycles = 0;
+
+   PrintFormat("BarCacheWriter v1.447: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
-      InitialBarCap);
+      InitialBarCap,
+      g_initBurstActive ? "ACTIVE" : "inactive");
 
    EventSetTimer(UpdateIntervalSec);
    return INIT_SUCCEEDED;
@@ -805,6 +1032,15 @@ void ExportAll()
    if(g_db == INVALID_HANDLE) return;
 
    g_cycleCount++;
+
+   // v1.447: Periodic demand.txt refresh — re-read every ~10 cycles (~5 min at
+   // 30s interval) so gap-fill requests written after OnInit get picked up.
+   // MQL5 has no direct mtime API for FILE_COMMON files, so we poll at a
+   // coarse cadence. Writer side is cheap: a few disk reads every 5 min.
+   if(g_cycleCount % 10 == 0)
+   {
+      LoadDemandFile(SymbolsTotal(MarketWatchOnly));
+   }
 
    // Periodic maintenance: every 60 cycles (~30 minutes at 30s interval).
    // PRAGMA incremental_vacuum reclaims freed pages from DELETE mode fragmentation.
@@ -900,7 +1136,13 @@ void ExportAll()
       bool isDemand = (g_demandCount > 0 && i < g_demandIdxSymCount)
                       ? g_isDemandIdx[i]
                       : false;
-      if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
+      // v1.447: Initial-burst — process demand symbols only, skip everything else
+      // so we don't waste cycles on the long tail until watched symbols are warm.
+      if(g_initBurstActive)
+      {
+         if(!isDemand) continue;
+      }
+      else if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
 
       SymbolSelect(symbol, true);
@@ -921,8 +1163,10 @@ void ExportAll()
          // near bar boundaries. This eliminates ~90% of CopyRates calls:
          // at 30s intervals, only M1 is checked every cycle; M5 every ~4 min,
          // H1 every ~48 min, D1 every ~19 hours, etc.
+         // v1.447: Skip gating during initial-burst — we want to populate
+         // every TF for demand symbols as fast as possible, not wait 4h for H4.
          int tfPeriod = g_tfPeriods[tf];
-         if(g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
+         if(!g_initBurstActive && g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
          {
             int elapsed = (int)(cycleNow - g_tfLastExportTime[tf]);
             if(elapsed < (int)(tfPeriod * 0.8))
@@ -934,6 +1178,33 @@ void ExportAll()
 
          string trackKey = symbol + ":" + g_tfStrings[tf];
          int idx = GetTrackIndex(trackKey);
+
+         // v1.447: Gap-fill request from terminal — force a bounded export and
+         // clear the request on success. Runs AHEAD of the normal track-time
+         // comparison so a mid-session gap request always wins.
+         int gapBars = GetGapFillMaxBars(trackKey);
+         if(gapBars > 0)
+         {
+            int cap = MathMin(gapBars, MaxBarsForTF(g_timeframes[tf]));
+            int done = ExportSymbolTF(symbol, g_timeframes[tf], cap, g_tfStrings[tf]);
+            if(done > 0)
+            {
+               exported++;
+               totalBars += done;
+               g_trackFails[idx] = 0;
+               g_tfLastExportTime[tf] = cycleNow;
+               MqlRates gapLast[];
+               if(CopyRates(symbol, g_timeframes[tf], 0, 1, gapLast) == 1)
+               {
+                  g_trackTimes[idx] = gapLast[0].time;
+                  g_trackDirty[idx] = true;
+               }
+               ClearGapFill(trackKey);
+               PrintFormat("BarCacheWriter: gap-fill %s — %d bars (cap %d)", trackKey, done, cap);
+               continue;
+            }
+            // Failed — fall through to normal path; ClearGapFill only on success.
+         }
 
          MqlRates lastRate[];
          int gotLast = CopyRates(symbol, g_timeframes[tf], 0, 1, lastRate);
@@ -1022,7 +1293,9 @@ void ExportAll()
          // holds the lock for the entire session — readers (Mt5Sync) wait on
          // busy_timeout. 200ms sleep gives readers a window between batches.
          // With TF gating + EXCLUSIVE lock, total cycle time is minimal.
-         Sleep(200);
+         // v1.447: Shorter sleep in burst mode — we want to finish cold-start
+         // warming quickly; readers can tolerate briefer contention windows.
+         Sleep(g_initBurstActive ? 50 : 200);
       }
    }
 
@@ -1076,9 +1349,10 @@ void ExportAll()
    if(first || TimeCurrent() - lastLog > 300 || failCount <= 3)
    {
       uint elapsed = GetTickCount() - tickStart;
-      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending | %dms (batch %d-%d of %d)",
+      PrintFormat("BarCacheWriter: %d exported, %d skipped, %d bars | %d pending | %dms (batch %d-%d of %d)%s",
          exported, skipped, totalBars, pendingSlots, elapsed,
-         rotationOffset, MathMin(rotationOffset + symbolsPerCycle, symCount), symCount);
+         rotationOffset, MathMin(rotationOffset + symbolsPerCycle, symCount), symCount,
+         g_initBurstActive ? " [BURST]" : "");
 
       // Diagnostic: if nothing exported, test first 3 symbols to see why
       if(exported == 0 && skipped == 0)
@@ -1098,6 +1372,33 @@ void ExportAll()
 
       lastLog = TimeCurrent();
       first = false;
+   }
+
+   // v1.447: Burst-mode exit check — once every demand symbol has at least
+   // one populated TF, drop back to the efficient rotation schedule.
+   if(g_initBurstActive)
+   {
+      g_initBurstCycles++;
+      if(CanExitInitialBurst())
+      {
+         PrintFormat("BarCacheWriter: initial-burst completed after %d cycles (%d tracked keys); reverting to rotation.",
+            g_initBurstCycles, g_trackCount);
+         g_initBurstActive = false;
+      }
+      else if(g_initBurstCycles % 10 == 0)
+      {
+         PrintFormat("BarCacheWriter: still in burst (cycle %d) — %d demand symbols, %d tracked keys",
+            g_initBurstCycles, g_demandCount, g_trackCount);
+      }
+   }
+
+   // v1.447: Heartbeat — written every cycle so readers can detect liveness
+   // without parsing logs. Single extra row-write per 30s cycle, negligible.
+   {
+      uint cycleMs = GetTickCount() - tickStart;
+      SafeBegin();
+      WriteHeartbeat(rotationOffset, symCount, cycleMs, exported, skipped);
+      SafeCommit();
    }
 }
 
