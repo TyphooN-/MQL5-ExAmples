@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.452"
+#property version   "1.453"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.453: IncrementalExportSymbolTF hole detection — if the fetch window (capped at 200 bars) can't reach back to the last existing bar AND the broker has bars in the gap, full re-export instead of partial merge. Previously a Wine crash / MT5 crash / internet outage / laptop hibernate longer than 200 × tfPeriod silently left a hole in the blob."
 #property description "v1.452: ExportAll gate-first — rotation/demand check runs before SymbolName/StringLen/IsForexSymbol, skipping ~650 of 851 symbols/cycle without paying string overhead. IntegrityCheck demand-strict (no fallback to check-all on empty demand list). Fix stale NORMAL-vs-EXCLUSIVE locking comment in inter-batch sleep."
 #property description "v1.451: CanExitInitialBurst binary search — replaces 3.15M string comparisons/cycle during burst with ~5800 (log2). Removes dead g_lastHeartbeatWrite variable."
 #property description "v1.450: Gap-fill early-bail via g_gapFillActive counter — skips the binary search in the 900-call/cycle hot path whenever no gap-fill request is outstanding (the steady-state case). Preserves v1.449 sort for when requests do arrive."
@@ -761,7 +762,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.452\"}",
+      "\"version\":\"1.453\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1026,7 +1027,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.452: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.453: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1702,6 +1703,27 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    int lastOff = 8 + (existingCount - 1) * 48;
    ReadRaw8(existingBlob, lastOff, bc);
    long lastExistingTsMs = bc.l;
+
+   // v1.453: Hole detection. If the oldest fetched bar is strictly newer
+   // than the last existing bar AND the broker has bars in that gap, our
+   // fixed-count fetch (capped at 200) couldn't reach back far enough.
+   // Partial merge in that case would silently drop the intermediate bars
+   // and stamp the row with TimeCurrent() — invisible to the terminal's
+   // gap detection downstream. Full re-export from D'1970.01.01' closes
+   // the hole in one shot.
+   //
+   // Covers: Wine crash mid-rotation, MT5 crash and restart, internet
+   // outage, laptop hibernate across weekends, any outage longer than
+   // the 200-bar fetch window. Weekend / market-closed gaps don't trip
+   // this — Bars() returns 0 for a range with no bars on the broker side.
+   long firstNewTsMs = (long)newRates[0].time * 1000;
+   if(firstNewTsMs > lastExistingTsMs)
+   {
+      datetime gapStart = (datetime)(lastExistingTsMs / 1000) + 1;
+      datetime gapEnd   = newRates[0].time - 1;
+      if(gapEnd >= gapStart && Bars(symbol, tf, gapStart, gapEnd) > 0)
+         return ExportSymbolTF(symbol, tf, 0, tfStr);
+   }
 
    // Find merge point
    int newStart = 0;
