@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.451"
+#property version   "1.452"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.452: ExportAll gate-first — rotation/demand check runs before SymbolName/StringLen/IsForexSymbol, skipping ~650 of 851 symbols/cycle without paying string overhead. IntegrityCheck demand-strict (no fallback to check-all on empty demand list). Fix stale NORMAL-vs-EXCLUSIVE locking comment in inter-batch sleep."
 #property description "v1.451: CanExitInitialBurst binary search — replaces 3.15M string comparisons/cycle during burst with ~5800 (log2). Removes dead g_lastHeartbeatWrite variable."
 #property description "v1.450: Gap-fill early-bail via g_gapFillActive counter — skips the binary search in the 900-call/cycle hot path whenever no gap-fill request is outstanding (the steady-state case). Preserves v1.449 sort for when requests do arrive."
 #property description "v1.449: Gap-fill lookup binary search — replaces 256-entry linear scan in GetGapFillMaxBars/ClearGapFill (hot path, ~230K string comparisons/cycle → ~7K). LoadDemandFile sorts g_gapFill* arrays after populate."
@@ -760,7 +761,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.451\"}",
+      "\"version\":\"1.452\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -937,19 +938,19 @@ int OnInit()
       SafeBegin();
       for(int si = 0; si < symCount; si++)
       {
+         // v1.452: Demand-driven only. Before, an empty demand list fell
+         // through to "check every symbol" as a backwards-compat default —
+         // removed. If demand.txt is absent (terminal hasn't written yet
+         // or user cleared it) there's nothing to integrity-check here;
+         // the normal rotation loop in ExportAll() will catch up once
+         // the terminal pushes a list. Gate runs index-only so non-demand
+         // symbols skip SymbolName/StringLen/IsForexSymbol overhead.
+         if(g_demandCount == 0 || si >= g_demandIdxSymCount || !g_isDemandIdx[si])
+            continue;
+
          string sym = SymbolName(si, MarketWatchOnly);
          if(StringLen(sym) == 0) continue;
          if(!g_isCFDServer && IsForexSymbol(sym)) continue;
-
-         // v1.440: Skip non-demand symbols entirely during integrity — incremental sync fills them.
-         // Only demand symbols (from TyphooN-Terminal) need immediate data on restart.
-         // If no demand list, check all symbols (backwards compat).
-         // v1.443: O(1) bitmap lookup instead of O(log m) binary search.
-         if(g_demandCount > 0)
-         {
-            if(si >= g_demandIdxSymCount || !g_isDemandIdx[si])
-               continue;
-         }
 
          SymbolSelect(sym, true);
 
@@ -1025,7 +1026,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.451: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.452: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1138,13 +1139,12 @@ void ExportAll()
 
    for(int i = 0; i < symCount; i++)
    {
-      string symbol = SymbolName(i, MarketWatchOnly);
-      if(StringLen(symbol) == 0) continue;
-
-      // Skip forex symbols on non-CFD servers
-      if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
-
-      // Rotation: skip symbols outside current batch window UNLESS they're in demand list.
+      // v1.452: Rotation/demand gate runs FIRST — index-only checks. Skipped
+      // symbols avoid SymbolName() + StringLen() + IsForexSymbol() cost.
+      // On non-CFD servers with 851 symbols, ~750 per cycle are outside the
+      // rotation window; previously each paid the string + forex-check toll
+      // (~1700 StringSubstr allocs + ~3800 binary-search compares) just to
+      // be discarded. Now they cost a single bool read.
       // v1.443: O(1) bitmap lookup replaces O(log m) BinarySearchKey call.
       bool isDemand = (g_demandCount > 0 && i < g_demandIdxSymCount)
                       ? g_isDemandIdx[i]
@@ -1157,6 +1157,12 @@ void ExportAll()
       }
       else if(!isDemand && (i < rotationOffset || i >= rotationOffset + symbolsPerCycle))
          continue;
+
+      string symbol = SymbolName(i, MarketWatchOnly);
+      if(StringLen(symbol) == 0) continue;
+
+      // Skip forex symbols on non-CFD servers
+      if(!g_isCFDServer && IsForexSymbol(symbol)) continue;
 
       SymbolSelect(symbol, true);
 
@@ -1302,10 +1308,11 @@ void ExportAll()
       {
          SafeCommit();
          inTxn = false;
-         // Yield CPU between batches. EXCLUSIVE locking mode means BarCacheWriter
-         // holds the lock for the entire session — readers (Mt5Sync) wait on
-         // busy_timeout. 200ms sleep gives readers a window between batches.
-         // With TF gating + EXCLUSIVE lock, total cycle time is minimal.
+         // Yield CPU between batches. locking_mode is NORMAL (default), so each
+         // SafeCommit() releases the RESERVED/EXCLUSIVE lock — readers (Mt5Sync)
+         // can grab a SHARED lock during this 200ms window. Without the sleep
+         // the writer would re-acquire the lock immediately on the next batch
+         // and readers would hit busy_timeout repeatedly.
          // v1.447: Shorter sleep in burst mode — we want to finish cold-start
          // warming quickly; readers can tolerate briefer contention windows.
          Sleep(g_initBurstActive ? 50 : 200);
