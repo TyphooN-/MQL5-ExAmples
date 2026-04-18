@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.458"
+#property version   "1.459"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.459: Gap-fill routes through IncrementalExportSymbolTF instead of capped ExportSymbolTF. Previous path INSERT-OR-REPLACE'd the blob with only the last N bars, destroying older cached history on a non-empty cache (e.g. a 1500-bar gap request on a 50K-bar 1Hour cache kept 1500, lost 48.5K). Merge path preserves existing bars for short gaps; v1.453 hole detection falls back to full re-export for long gaps. Both paths heal arbitrarily long outages without data loss."
 #property description "v1.458: IntegrityCheck magic-byte check now covers all 4 TTBR bytes — previous partial 'TT' match could let a corrupted blob through and read garbage as the bar count. Matches the full-magic check already used in IncrementalExportSymbolTF."
 #property description "v1.457: Drop dead g_demandFileMtime + g_demandFilePath globals — mtime-change reload scheme was replaced by pure cycle cadence (every 2 cycles ~1 min) in v1.448, left orphaned state. Path now logged directly from the local in LoadDemandFile."
 #property description "v1.456: IntegrityCheck adds staleness detection — compares DB newest-bar ts_ms against MT5's latest bar and re-exports symbols where the cache is >2 TF periods behind. Catches outage scenarios (EA downtime, broker disconnect, account loss, /dev/shm stale persistence) that previously slipped through the dbCount<100 filter."
@@ -765,7 +766,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.458\"}",
+      "\"version\":\"1.459\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1085,7 +1086,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.458: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.459: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1257,14 +1258,23 @@ void ExportAll()
          string trackKey = symbol + ":" + g_tfStrings[tf];
          int idx = GetTrackIndex(trackKey);
 
-         // v1.447: Gap-fill request from terminal — force a bounded export and
-         // clear the request on success. Runs AHEAD of the normal track-time
+         // v1.447: Gap-fill request from terminal — force a sync and clear
+         // the request on success. Runs AHEAD of the normal track-time
          // comparison so a mid-session gap request always wins.
+         //
+         // v1.459: Route through IncrementalExportSymbolTF instead of a
+         // capped ExportSymbolTF. Previously `ExportSymbolTF(sym, tf, cap)`
+         // INSERT-OR-REPLACE'd the blob with only the last `cap` bars —
+         // on a non-empty cache this threw away older history (e.g. a
+         // 1500-bar gap request on a 50K-bar 1Hour cache kept 1500 and
+         // lost 48.5K bars). IncrementalExportSymbolTF merges ~200 fetched
+         // bars onto the existing blob for short gaps, and its v1.453
+         // hole-detection falls back to full re-export for long gaps —
+         // both paths preserve all existing bars.
          int gapBars = GetGapFillMaxBars(trackKey);
          if(gapBars > 0)
          {
-            int cap = MathMin(gapBars, MaxBarsForTF(g_timeframes[tf]));
-            int done = ExportSymbolTF(symbol, g_timeframes[tf], cap, g_tfStrings[tf]);
+            int done = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
             if(done > 0)
             {
                exported++;
@@ -1278,7 +1288,7 @@ void ExportAll()
                   g_trackDirty[idx] = true;
                }
                ClearGapFill(trackKey);
-               PrintFormat("BarCacheWriter: gap-fill %s — %d bars (cap %d)", trackKey, done, cap);
+               PrintFormat("BarCacheWriter: gap-fill %s — merged to %d bars (req %d)", trackKey, done, gapBars);
                continue;
             }
             // Failed — fall through to normal path; ClearGapFill only on success.
