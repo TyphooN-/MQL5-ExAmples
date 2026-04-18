@@ -822,9 +822,9 @@ int OnInit()
    // Limit journal file growth: cap at 4MB. Prevents journal from growing
    // unbounded during large batch transactions. SQLite reuses the file.
    DatabaseExecute(g_db, "PRAGMA journal_size_limit=4194304");
-   // WAL autocheckpoint: checkpoint every 2000 pages (~8MB) instead of default 1000.
-   // Fewer checkpoints = fewer disk syncs = less SSD wear. Trade-off: larger WAL file.
-   DatabaseExecute(g_db, "PRAGMA wal_autocheckpoint=2000");
+   // v1.449: Removed stale `PRAGMA wal_autocheckpoint=2000` — it's a no-op
+   // in DELETE journal mode (required because WAL shared memory doesn't
+   // cross the Wine/Linux boundary). Had no effect; only confusing.
    // busy_timeout=5000: retry for 5s on lock instead of failing immediately.
    DatabaseExecute(g_db, "PRAGMA busy_timeout=5000");
 
