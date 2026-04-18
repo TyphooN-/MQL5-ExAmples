@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.455"
+#property version   "1.456"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.456: IntegrityCheck adds staleness detection — compares DB newest-bar ts_ms against MT5's latest bar and re-exports symbols where the cache is >2 TF periods behind. Catches outage scenarios (EA downtime, broker disconnect, account loss, /dev/shm stale persistence) that previously slipped through the dbCount<100 filter."
 #property description "v1.455: LoadDemandFile validates parts[0] is a symbol and parts[1] is a known TF — rejects rows whose symbol slot is accidentally a TF string (e.g. '1Hour:1Hour:0:1500') before they pollute g_demandSymbols and waste rotation cycles on non-existent broker symbols. Belt+suspenders for the terminal-side canonicalisation fix."
 #property description "v1.454: IncrementalExportSymbolTF reverse-order guard — if the newest fetched bar is strictly older than the cached last bar, force full re-export. Previously the merge loop would silently append older bars after the existing ones, producing a non-monotonic blob. Covers clock-skew, broker data switch, and bit-rot corruption."
 #property description "v1.453: IncrementalExportSymbolTF hole detection — if the fetch window (capped at 200 bars) can't reach back to the last existing bar AND the broker has bars in the gap, full re-export instead of partial merge. Previously a Wine crash / MT5 crash / internet outage / laptop hibernate longer than 200 × tfPeriod silently left a hole in the blob."
@@ -773,7 +774,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.455\"}",
+      "\"version\":\"1.456\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -972,9 +973,12 @@ int OnInit()
             int mt5Count = Bars(sym, enumTf);
             if(mt5Count < 100) continue; // skip symbols with minimal data
 
-            // Get DB bar count
+            // Get DB bar count and newest bar timestamp (for staleness detection).
+            // TTBR format: [4 magic "TTBR"][4 count LE u32][48B/bar: i64 ts_ms, 5×f64].
+            // Bars stored oldest→newest, so newest ts_ms lives at offset 8 + (count-1)*48.
             string cacheKey = "mt5:" + sym + ":" + g_tfStrings[ti];
             int dbCount = 0;
+            long dbLastTsMs = 0;
             if(g_stmtBarRead != INVALID_HANDLE)
             {
                DatabaseReset(g_stmtBarRead);
@@ -984,13 +988,50 @@ int OnInit()
                   uchar tmpBlob[];
                   DatabaseColumnBlob(g_stmtBarRead, 0, tmpBlob);
                   if(ArraySize(tmpBlob) >= 8 && tmpBlob[0] == 'T' && tmpBlob[1] == 'T')
+                  {
                      dbCount = (int)tmpBlob[4] | ((int)tmpBlob[5] << 8) | ((int)tmpBlob[6] << 16) | ((int)tmpBlob[7] << 24);
+                     if(dbCount > 0)
+                     {
+                        int lastBarOff = 8 + (dbCount - 1) * 48;
+                        if(ArraySize(tmpBlob) >= lastBarOff + 8)
+                        {
+                           ByteConv bc;
+                           for(int k = 0; k < 8; k++) bc.b[k] = tmpBlob[lastBarOff + k];
+                           dbLastTsMs = bc.l;
+                        }
+                     }
+                  }
                }
             }
             checkedCount++;
 
-            // Re-export if DB is empty or very short (<100 bars) — incremental sync fills the gap
-            if(dbCount < 100)
+            // Re-export triggers:
+            //  1. Empty/short DB (<100 bars) — bootstrap or corruption.
+            //  2. Stale DB — newest cached bar is >2 TF periods behind MT5's latest.
+            //     Catches outage scenarios: EA was down, broker disconnected, account
+            //     temporarily lost, /dev/shm persisted old data. The normal 30s cycle
+            //     would eventually fill the gap but IntegrityCheck resolves it at start.
+            bool needsReExport = (dbCount < 100);
+            bool isStale = false;
+            if(!needsReExport && dbLastTsMs > 0)
+            {
+               MqlRates latestRate[];
+               datetime mt5LastTs = 0;
+               if(CopyRates(sym, enumTf, 0, 1, latestRate) == 1)
+                  mt5LastTs = latestRate[0].time;
+               if(mt5LastTs > 0)
+               {
+                  long mt5LastMs = (long)mt5LastTs * 1000;
+                  long tfMs = (long)g_tfPeriods[ti] * 1000;
+                  if(tfMs > 0 && mt5LastMs - dbLastTsMs > 2 * tfMs)
+                  {
+                     needsReExport = true;
+                     isStale = true;
+                  }
+               }
+            }
+
+            if(needsReExport)
             {
                // Cap bars during integrity — full history fills via incremental 30s cycle
                int maxBars = MathMin(MaxBarsForTF(enumTf), InitialBarCap);
@@ -1009,8 +1050,19 @@ int OnInit()
                      SaveTrackTime(trackKey, lastRate[0].time);
                   }
                   if(reExportCount <= 50) // limit log spam
-                     PrintFormat("  Integrity fix: %s — DB %d bars, MT5 %d, exported %d (cap %d)",
-                        cacheKey, dbCount, mt5Count, bars, maxBars);
+                  {
+                     if(isStale)
+                     {
+                        long ageMin = ((long)TimeCurrent() * 1000 - dbLastTsMs) / 60000;
+                        PrintFormat("  Integrity fix (stale): %s — DB last %s (%d min old), refreshed %d bars",
+                           cacheKey, TimeToString((datetime)(dbLastTsMs/1000)), (int)ageMin, bars);
+                     }
+                     else
+                     {
+                        PrintFormat("  Integrity fix: %s — DB %d bars, MT5 %d, exported %d (cap %d)",
+                           cacheKey, dbCount, mt5Count, bars, maxBars);
+                     }
+                  }
                }
             }
          }
@@ -1038,7 +1090,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.455: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.456: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
