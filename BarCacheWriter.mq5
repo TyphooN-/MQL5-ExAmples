@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.454"
+#property version   "1.455"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.455: LoadDemandFile validates parts[0] is a symbol and parts[1] is a known TF — rejects rows whose symbol slot is accidentally a TF string (e.g. '1Hour:1Hour:0:1500') before they pollute g_demandSymbols and waste rotation cycles on non-existent broker symbols. Belt+suspenders for the terminal-side canonicalisation fix."
 #property description "v1.454: IncrementalExportSymbolTF reverse-order guard — if the newest fetched bar is strictly older than the cached last bar, force full re-export. Previously the merge loop would silently append older bars after the existing ones, producing a non-monotonic blob. Covers clock-skew, broker data switch, and bit-rot corruption."
 #property description "v1.453: IncrementalExportSymbolTF hole detection — if the fetch window (capped at 200 bars) can't reach back to the last existing bar AND the broker has bars in the gap, full re-export instead of partial merge. Previously a Wine crash / MT5 crash / internet outage / laptop hibernate longer than 200 × tfPeriod silently left a hole in the blob."
 #property description "v1.452: ExportAll gate-first — rotation/demand check runs before SymbolName/StringLen/IsForexSymbol, skipping ~650 of 851 symbols/cycle without paying string overhead. IntegrityCheck demand-strict (no fallback to check-all on empty demand list). Fix stale NORMAL-vs-EXCLUSIVE locking comment in inter-batch sleep."
@@ -587,6 +588,15 @@ void LoadDemandFile(int symCount)
       int nParts = StringSplit(line, ':', parts);
       if(nParts != 4 || StringLen(parts[0]) == 0 || StringLen(parts[1]) == 0) continue;
 
+      // v1.455: reject rows where the symbol slot is itself a known TF
+      // string (e.g. the terminal's old bug wrote "1Hour:1Hour:0:1500"
+      // when a Screener/watchlist chart had a full cache key in
+      // chart.symbol). Also require the TF slot to parse — a garbage TF
+      // would produce PERIOD_CURRENT (0) and silently export the wrong
+      // series, so catch it here instead.
+      if(StrToTF(parts[0]) != (ENUM_TIMEFRAMES)0) continue;
+      if(StrToTF(parts[1]) == (ENUM_TIMEFRAMES)0) continue;
+
       int maxBars = (int)StringToInteger(parts[3]);
       if(maxBars > 0)
       {
@@ -763,7 +773,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.454\"}",
+      "\"version\":\"1.455\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1028,7 +1038,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.454: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.455: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
