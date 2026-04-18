@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.462"
+#property version   "1.463"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.463: Startup integrity exports broker's full available history (min(mt5Count, MaxBarsForTF)) instead of the old InitialBarCap=1000 fast-restart limit. Matches the terminal's integrity target; avoids the ~30 s window where v1.462's shallow-redirect fills the gap between a 1000-bar startup stub and the 100K target."
 #property description "v1.462: Shallow-cache redirect on gap-fill — when the terminal's gap-fill request asks for more bars than currently cached (integrity target: 100K for M1-H4, full history for D1/W1/MN1), route to ExportSymbolTF(maxBars=gapBars) instead of IncrementalExportSymbolTF. The incremental merge only APPENDS newer bars, so a fresh-but-shallow cache would otherwise never grow. New GetCachedBarCount helper reads the TTBR header for the decision."
 #property description "v1.461: Gap-fill bypasses TF-period gating — previously the 80% gate at the top of the per-TF loop skipped rows before the gap-fill check, leaving D1/W1/MN1 gap requests unserviced (terminal looped on the same ~256 stale pairs). Now checks GetGapFillMaxBars first and short-circuits the gating when a request is pending."
 #property description "v1.460: DeleteStaleBarCacheRows — DELETE bar rows not refreshed in 14 days (metadata preserved) on same cycle as VACUUM so freed pages reclaim in one pass. Bounds /dev/shm growth when symbols leave the demand set or broker list."
@@ -790,7 +791,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.462\"}",
+      "\"version\":\"1.463\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1053,8 +1054,17 @@ int OnInit()
 
             if(needsReExport)
             {
-               // Cap bars during integrity — full history fills via incremental 30s cycle
-               int maxBars = MathMin(MaxBarsForTF(enumTf), InitialBarCap);
+               // v1.463: Export the broker's full available history (capped
+               // at MaxBarsForTF) instead of the old fast-restart limit of
+               // InitialBarCap=1000. Matches the terminal's integrity target
+               // (D1/W1/MN1 = all available, M1-H4 = last 100K). Previously
+               // v1.462's shallow-redirect healed this on the next cycle
+               // anyway, but routing it through startup integrity avoids
+               // the ~30 s window where charts show a 1000-bar stub before
+               // the live gap-fill kicks in. mt5Count is the Bars() value
+               // we already queried at line ~967 for staleness detection,
+               // so we reuse it rather than calling Bars() again.
+               int maxBars = MathMin(mt5Count, MaxBarsForTF(enumTf));
                int bars = ExportSymbolTF(sym, enumTf, maxBars, g_tfStrings[ti]);
                if(bars > 0)
                {
@@ -1110,7 +1120,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.462: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.463: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
