@@ -752,8 +752,9 @@ bool CanExitInitialBurst()
 }
 
 // v1.447: Write a heartbeat row so the terminal can detect liveness.
-// JSON payload: {ts, rotation_offset, sym_count, cycle_ms, init_burst,
-//                symbols_ready, cycle_count}
+// JSON payload keys: ts, rotation_offset, sym_count, cycle_ms,
+// init_burst_active, init_burst_cycles, cycle_count, exported, skipped,
+// track_count, demand_count, version.
 void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exportedCount, int skippedCount)
 {
    if(g_stmtMetaInsert == INVALID_HANDLE) return;
