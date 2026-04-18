@@ -25,7 +25,7 @@
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.459"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
-#property description "v1.459: Gap-fill routes through IncrementalExportSymbolTF instead of capped ExportSymbolTF. Previous path INSERT-OR-REPLACE'd the blob with only the last N bars, destroying older cached history on a non-empty cache (e.g. a 1500-bar gap request on a 50K-bar 1Hour cache kept 1500, lost 48.5K). Merge path preserves existing bars for short gaps; v1.453 hole detection falls back to full re-export for long gaps. Both paths heal arbitrarily long outages without data loss."
+#property description "v1.459: Gap-fill uses IncrementalExportSymbolTF (merge) instead of capped ExportSymbolTF (replace). Preserves cached history; long gaps heal via v1.453 hole-detection full re-export — no data loss."
 #property description "v1.458: IntegrityCheck magic-byte check now covers all 4 TTBR bytes — previous partial 'TT' match could let a corrupted blob through and read garbage as the bar count. Matches the full-magic check already used in IncrementalExportSymbolTF."
 #property description "v1.457: Drop dead g_demandFileMtime + g_demandFilePath globals — mtime-change reload scheme was replaced by pure cycle cadence (every 2 cycles ~1 min) in v1.448, left orphaned state. Path now logged directly from the local in LoadDemandFile."
 #property description "v1.456: IntegrityCheck adds staleness detection — compares DB newest-bar ts_ms against MT5's latest bar and re-exports symbols where the cache is >2 TF periods behind. Catches outage scenarios (EA downtime, broker disconnect, account loss, /dev/shm stale persistence) that previously slipped through the dbCount<100 filter."
@@ -992,7 +992,7 @@ int OnInit()
                         if(ArraySize(tmpBlob) >= lastBarOff + 8)
                         {
                            ByteConv bc;
-                           for(int k = 0; k < 8; k++) bc.b[k] = tmpBlob[lastBarOff + k];
+                           ReadRaw8(tmpBlob, lastBarOff, bc);
                            dbLastTsMs = bc.l;
                         }
                      }
