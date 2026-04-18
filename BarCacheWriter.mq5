@@ -25,6 +25,7 @@
 #property link      "https://www.marketwizardry.org/"
 #property version   "1.447"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.448: demand.txt v3-only (SYMBOL:TF:LAST_TS:MAX_BARS) — drops dead v1 bare / v2 3-part branches in LoadDemandFile, simplifies parser, removes unused g_demandV2 arrays."
 #property description "v1.447: Heartbeat row (mt5:__HEARTBEAT__:{accountId}) + initial-burst mode — on cold start (empty /dev/shm) process demand symbols sequentially with no rotation / TF gating until cache is warm. Terminal can detect staleness via heartbeat."
 #property description "v1.446: Thread cached tfStr/tfPeriod into ExportSymbolTF/IncrementalExportSymbolTF — eliminates last TFToStr()/PeriodSeconds() calls from hot path."
 #property description "v1.445: Cache TF periods (7659 PeriodSeconds calls/cycle → 0), cache g_tfCount, consolidate TimeCurrent() calls in ExportAll."
@@ -700,7 +701,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.447\"}",
+      "\"version\":\"1.448\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -966,7 +967,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.447: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.448: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -985,11 +986,13 @@ void ExportAll()
 
    g_cycleCount++;
 
-   // v1.447: Periodic demand.txt refresh — re-read every ~10 cycles (~5 min at
-   // 30s interval) so gap-fill requests written after OnInit get picked up.
-   // MQL5 has no direct mtime API for FILE_COMMON files, so we poll at a
-   // coarse cadence. Writer side is cheap: a few disk reads every 5 min.
-   if(g_cycleCount % 10 == 0)
+   // v1.448: Periodic demand.txt refresh — every 2 cycles (~1 min at 30s
+   // interval). Previously 10 cycles (~5 min) which meant a newly-opened
+   // chart tab could wait up to 5 min for its gap-fill request to land,
+   // on top of the rotation-queue latency before the EA services it.
+   // The file is <10KB and the reload is ~1ms on /dev/shm — cost is
+   // negligible compared to the responsiveness win.
+   if(g_cycleCount % 2 == 0)
    {
       LoadDemandFile(SymbolsTotal(MarketWatchOnly));
    }
