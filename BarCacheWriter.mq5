@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.463"
+#property version   "1.464"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.464: RamdiskMode input (default true) — when the DB lives on /dev/shm (deploy_ramdisk.sh), switch to journal_mode=MEMORY + synchronous=OFF. Eliminates SQLite's DELETE-mode journal file create/truncate on every BEGIN/COMMIT, which under Wine translates to a stream of NtCreateFile/NtWriteFile/NtDeleteFile syscalls that dominate ExportAll throughput. Safe on tmpfs (reboot wipes the DB anyway). IntegrityCheck catches any blob corrupted by mid-COMMIT crash on next startup. Non-ramdisk users set RamdiskMode=false to keep DELETE journal + sync=NORMAL for durability."
 #property description "v1.463: Startup integrity exports broker's full available history (min(mt5Count, MaxBarsForTF)) instead of the old InitialBarCap=1000 fast-restart limit. Matches the terminal's integrity target; avoids the ~30 s window where v1.462's shallow-redirect fills the gap between a 1000-bar startup stub and the 100K target."
 #property description "v1.462: Shallow-cache redirect on gap-fill — when the terminal's gap-fill request asks for more bars than currently cached (integrity target: 100K for M1-H4, full history for D1/W1/MN1), route to ExportSymbolTF(maxBars=gapBars) instead of IncrementalExportSymbolTF. The incremental merge only APPENDS newer bars, so a fresh-but-shallow cache would otherwise never grow. New GetCachedBarCount helper reads the TTBR header for the decision."
 #property description "v1.461: Gap-fill bypasses TF-period gating — previously the 80% gate at the top of the per-TF loop skipped rows before the gap-fill check, leaving D1/W1/MN1 gap requests unserviced (terminal looped on the same ~256 stale pairs). Now checks GetGapFillMaxBars first and short-circuits the gating when a request is pending."
@@ -59,6 +60,7 @@ input bool   ForceReExport     = false;  // true = clear tracking, re-export all
 input bool   IntegrityCheck    = true;   // Verify bar counts on startup, re-export short keys
 input int    InitialBarCap     = 1000;   // Max bars per key on startup integrity (1000 = fast restart)
 input int    SpecsCacheMin     = 60;     // Minutes between full symbol spec refreshes (default 1h)
+input bool   RamdiskMode       = true;   // DB on /dev/shm (deploy_ramdisk.sh) — use MEMORY journal + sync=OFF to eliminate journal file I/O under Wine. Set false when DB is on regular disk.
 
 int g_db = INVALID_HANDLE;
 string g_accountTag = "";
@@ -791,7 +793,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.463\"}",
+      "\"version\":\"1.464\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -860,11 +862,35 @@ int OnInit()
    // without scanning through multi-MB blob rows. Drops metadata queries from ~12s to <100ms.
    DatabaseExecute(g_db, "CREATE INDEX IF NOT EXISTS idx_bar_meta ON bar_cache(key, timestamp, bar_count)");
 
-   // DELETE journal mode — WAL shared memory doesn't work across Wine/Linux boundary.
-   DatabaseExecute(g_db, "PRAGMA journal_mode=DELETE");
-   // NORMAL sync: fsync only on critical moments, not every transaction.
-   // DELETE mode already journals changes — NORMAL is safe for power loss.
-   DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
+   // v1.464: Pick journal mode based on DB backing store.
+   //   RamdiskMode=true (deploy_ramdisk.sh → DB on /dev/shm):
+   //     - journal_mode=MEMORY: rollback journal kept in RAM, no journal file
+   //       created/truncated on every BEGIN/COMMIT. Under Wine, DELETE mode's
+   //       journal churn is the dominant SQLite-under-Wine cost — every
+   //       transaction pays NtCreateFile + NtWriteFile + NtClose + NtDeleteFile
+   //       through Wine's file path. MEMORY eliminates all of it.
+   //     - synchronous=OFF: skip fsync on commit. Safe on tmpfs (reboot wipes
+   //       the DB anyway, so fsync durability is meaningless). IntegrityCheck
+   //       at next startup catches any blob corrupted by mid-COMMIT crash.
+   //   RamdiskMode=false (DB on regular disk):
+   //     - journal_mode=DELETE: rollback journal persisted for crash safety.
+   //       WAL unusable because its shared-memory mmap doesn't cross the
+   //       Wine/Linux boundary (the terminal-side Mt5Sync reader can't map
+   //       the same -shm/-wal files).
+   //     - synchronous=NORMAL: fsync on critical moments only.
+   // Either mode is safe vs Mt5Sync reads — readers see the last committed
+   // page image through SQLite's normal visibility rules regardless of
+   // journal location.
+   if(RamdiskMode)
+   {
+      DatabaseExecute(g_db, "PRAGMA journal_mode=MEMORY");
+      DatabaseExecute(g_db, "PRAGMA synchronous=OFF");
+   }
+   else
+   {
+      DatabaseExecute(g_db, "PRAGMA journal_mode=DELETE");
+      DatabaseExecute(g_db, "PRAGMA synchronous=NORMAL");
+   }
    // NORMAL locking: acquire/release per transaction. EXCLUSIVE would block
    // Mt5Sync readers permanently. The batch transaction already amortizes
    // lock overhead (10 symbols per BEGIN/COMMIT = ~85 transactions per cycle
@@ -1120,11 +1146,12 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.463: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.464: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
       InitialBarCap,
+      RamdiskMode ? "MEMORY+sync=OFF" : "DELETE+sync=NORMAL",
       g_initBurstActive ? "ACTIVE" : "inactive");
 
    EventSetTimer(UpdateIntervalSec);
