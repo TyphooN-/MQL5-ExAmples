@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.449"
+#property version   "1.450"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.450: Gap-fill early-bail via g_gapFillActive counter — skips the binary search in the 900-call/cycle hot path whenever no gap-fill request is outstanding (the steady-state case). Preserves v1.449 sort for when requests do arrive."
 #property description "v1.449: Gap-fill lookup binary search — replaces 256-entry linear scan in GetGapFillMaxBars/ClearGapFill (hot path, ~230K string comparisons/cycle → ~7K). LoadDemandFile sorts g_gapFill* arrays after populate."
 #property description "v1.448: demand.txt v3-only (SYMBOL:TF:LAST_TS:MAX_BARS) — drops dead v1 bare / v2 3-part branches in LoadDemandFile, simplifies parser, removes unused g_demandV2 arrays."
 #property description "v1.447: Heartbeat row (mt5:__HEARTBEAT__:{accountId}) + initial-burst mode — on cold start (empty /dev/shm) process demand symbols sequentially with no rotation / TF gating until cache is warm. Terminal can detect staleness via heartbeat."
@@ -69,6 +70,13 @@ string   g_gapFillKeys[];     // "SYMBOL:TF" e.g. "EURUSD:1Hour"
 long     g_gapFillLastTs[];   // ms
 int      g_gapFillMaxBars[];
 int      g_gapFillCount = 0;
+// v1.450: active-count tracking for early-bail. Mirrors how many entries
+// in g_gapFillMaxBars[] are still > 0 (i.e. still have pending work).
+// LoadDemandFile sets this to the number of v3 lines with MAX_BARS > 0;
+// ClearGapFill decrements when it zeros an active slot. When this is 0,
+// GetGapFillMaxBars can short-circuit without running a binary search —
+// which is the steady-state case for the 900 calls per ExportAll cycle.
+int      g_gapFillActive = 0;
 
 // v1.447: Re-read demand.txt when its mtime changes so gap-fill requests
 // written after OnInit get picked up without an EA restart.
@@ -511,20 +519,29 @@ int BinarySearchGap(string symTf)
 }
 
 // Look up a pending gap-fill request. Returns MAX_BARS if a request is
-// outstanding for this symbol:TF, 0 otherwise.
+// outstanding for this symbol:TF, 0 otherwise. v1.450: early-bail when
+// there is no active gap request at all — skips the binary search for
+// the ~900 calls per ExportAll cycle that happen in steady state.
 int GetGapFillMaxBars(string symTf)
 {
+   if(g_gapFillActive == 0) return 0;
    int idx = BinarySearchGap(symTf);
    if(idx < 0) return 0;
    return g_gapFillMaxBars[idx];
 }
 
 // Mark a gap-fill request as served so it isn't re-processed next cycle.
-// Called after a successful ExportSymbolTF on a gap-fill key.
+// Called after a successful ExportSymbolTF on a gap-fill key. v1.450:
+// decrement the active counter on the 1→0 transition so the next lookup
+// can short-circuit.
 void ClearGapFill(string symTf)
 {
    int idx = BinarySearchGap(symTf);
-   if(idx >= 0) g_gapFillMaxBars[idx] = 0;
+   if(idx >= 0 && g_gapFillMaxBars[idx] > 0)
+   {
+      g_gapFillMaxBars[idx] = 0;
+      if(g_gapFillActive > 0) g_gapFillActive--;
+   }
 }
 
 // Shared demand.txt loader — v3 format only: every line is
@@ -536,6 +553,7 @@ void LoadDemandFile(int symCount)
 {
    g_demandCount = 0;
    g_gapFillCount = 0;
+   g_gapFillActive = 0;
    ArrayResize(g_demandSymbols, 100);
    ArrayResize(g_gapFillKeys, 16);
    ArrayResize(g_gapFillLastTs, 16);
@@ -580,6 +598,7 @@ void LoadDemandFile(int symCount)
          g_gapFillLastTs[g_gapFillCount]  = StringToInteger(parts[2]);
          g_gapFillMaxBars[g_gapFillCount] = maxBars;
          g_gapFillCount++;
+         g_gapFillActive++;
       }
       if(g_demandCount >= ArraySize(g_demandSymbols))
          ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
@@ -734,7 +753,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.449\"}",
+      "\"version\":\"1.450\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1000,7 +1019,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.449: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.450: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
