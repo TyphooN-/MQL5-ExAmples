@@ -55,24 +55,15 @@ string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuildi
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 datetime g_specsLastDbWrite = 0;             // v1.443: When specs CSV was last persisted to DB (skip redundant writes)
 
-// Demand symbols — loaded from demand.txt in OnInit, used in ExportAll
+// Demand symbols — loaded from demand.txt in OnInit, used in ExportAll.
+// v3 format only: every line is SYMBOL:TF:LAST_TS_MS:MAX_BARS. MAX_BARS=0
+// is passive demand (normal rotation export); MAX_BARS>0 is a gap-fill
+// request — force-export that many recent bars overriding the incremental
+// path. Gap entries are consumed once: on successful export the
+// corresponding MAX_BARS is zeroed so the request is not re-served.
 string g_demandSymbols[];     // flat symbol list (sorted for binary search)
 int g_demandCount = 0;
-
-// v1.447: Promote v2 per-symbol:TF last-seen timestamps to globals so both
-// startup integrity and the ExportAll hot loop can consult them. The terminal
-// writes these to tell us "I already have data up to LAST_TS, skip older bars."
-string   g_demandV2Keys[];        // "SYMBOL:TF" e.g. "EURUSD:1Hour"
-datetime g_demandV2Timestamps[];  // LAST_TS in seconds
-int      g_demandV2Count = 0;
-
-// v1.447: v3 gap-fill requests — SYMBOL:TF:LAST_TS:MAX_BARS (4 colons).
-// When MAX_BARS > 0, the EA force-exports that many bars from the broker
-// regardless of track state, overriding the normal incremental path. Used by
-// the terminal when it detects a gap on chart load (expected last-bar time
-// is older than actual). Entries are consumed once: on successful export the
-// corresponding MAX_BARS is zeroed so the request is not re-served next cycle.
-string   g_gapFillKeys[];
+string   g_gapFillKeys[];     // "SYMBOL:TF" e.g. "EURUSD:1Hour"
 long     g_gapFillLastTs[];   // ms
 int      g_gapFillMaxBars[];
 int      g_gapFillCount = 0;
@@ -524,20 +515,16 @@ void ClearGapFill(string symTf)
    }
 }
 
-// v1.447: Shared demand.txt loader — parses v1 (plain symbol), v2
-// (SYMBOL:TF:LAST_TS) and v3 (SYMBOL:TF:LAST_TS:MAX_BARS) entries. Called
-// from OnInit once and from ExportAll whenever the demand file's mtime
-// changes. Rebuilds g_demandSymbols, g_demandV2*, g_gapFill* globals from
-// scratch — no incremental merging, keeps semantics simple.
+// Shared demand.txt loader — v3 format only: every line is
+// SYMBOL:TF:LAST_TS_MS:MAX_BARS. MAX_BARS=0 is passive demand;
+// MAX_BARS>0 is a gap-fill request. Called from OnInit once and from
+// ExportAll whenever the demand file's mtime changes. Rebuilds
+// g_demandSymbols + g_gapFill* globals from scratch.
 void LoadDemandFile(int symCount)
 {
-   // Clear previous state.
    g_demandCount = 0;
-   g_demandV2Count = 0;
    g_gapFillCount = 0;
    ArrayResize(g_demandSymbols, 100);
-   ArrayResize(g_demandV2Keys, 100);
-   ArrayResize(g_demandV2Timestamps, 100);
    ArrayResize(g_gapFillKeys, 16);
    ArrayResize(g_gapFillLastTs, 16);
    ArrayResize(g_gapFillMaxBars, 16);
@@ -565,12 +552,11 @@ void LoadDemandFile(int symCount)
 
       string parts[];
       int nParts = StringSplit(line, ':', parts);
-      if(nParts == 4)
+      if(nParts != 4 || StringLen(parts[0]) == 0 || StringLen(parts[1]) == 0) continue;
+
+      int maxBars = (int)StringToInteger(parts[3]);
+      if(maxBars > 0)
       {
-         // v3 gap-fill: SYMBOL:TF:LAST_TS_MS:MAX_BARS
-         string symTf = parts[0] + ":" + parts[1];
-         long tsMs    = StringToInteger(parts[2]);
-         int maxBars  = (int)StringToInteger(parts[3]);
          if(g_gapFillCount >= ArraySize(g_gapFillKeys))
          {
             int ng = g_gapFillCount * 2 + 1;
@@ -578,44 +564,15 @@ void LoadDemandFile(int symCount)
             ArrayResize(g_gapFillLastTs, ng);
             ArrayResize(g_gapFillMaxBars, ng);
          }
-         g_gapFillKeys[g_gapFillCount]    = symTf;
-         g_gapFillLastTs[g_gapFillCount]  = tsMs;
+         g_gapFillKeys[g_gapFillCount]    = parts[0] + ":" + parts[1];
+         g_gapFillLastTs[g_gapFillCount]  = StringToInteger(parts[2]);
          g_gapFillMaxBars[g_gapFillCount] = maxBars;
          g_gapFillCount++;
-         // Still add to flat symbol list so rotation includes it.
-         if(g_demandCount >= ArraySize(g_demandSymbols))
-            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-         g_demandSymbols[g_demandCount] = parts[0];
-         g_demandCount++;
       }
-      else if(nParts == 3)
-      {
-         // v2 timestamped demand.
-         string symTf = parts[0] + ":" + parts[1];
-         long tsMs = StringToInteger(parts[2]);
-         datetime ts = (datetime)(tsMs / 1000);
-         if(g_demandV2Count >= ArraySize(g_demandV2Keys))
-         {
-            int nv = g_demandV2Count * 2 + 1;
-            ArrayResize(g_demandV2Keys, nv);
-            ArrayResize(g_demandV2Timestamps, nv);
-         }
-         g_demandV2Keys[g_demandV2Count]       = symTf;
-         g_demandV2Timestamps[g_demandV2Count] = ts;
-         g_demandV2Count++;
-         if(g_demandCount >= ArraySize(g_demandSymbols))
-            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-         g_demandSymbols[g_demandCount] = parts[0];
-         g_demandCount++;
-      }
-      else if(nParts == 1 && StringLen(line) > 0)
-      {
-         // v1 bare symbol.
-         if(g_demandCount >= ArraySize(g_demandSymbols))
-            ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
-         g_demandSymbols[g_demandCount] = line;
-         g_demandCount++;
-      }
+      if(g_demandCount >= ArraySize(g_demandSymbols))
+         ArrayResize(g_demandSymbols, g_demandCount * 2 + 1);
+      g_demandSymbols[g_demandCount] = parts[0];
+      g_demandCount++;
    }
    FileClose(h);
 
@@ -644,16 +601,11 @@ void LoadDemandFile(int symCount)
 
    RebuildDemandIndexBitmap(symCount);
 
-   // Remember file path + mtime for change detection.
    g_demandFilePath = path;
-   // MQL5 FileOpen does not expose mtime directly — we use the combined bar
-   // of g_demandCount+g_gapFillCount+modTime approach: check via FileTime on
-   // reopen. Store TimeCurrent() as a pseudo-mtime so we refresh at most every
-   // DEMAND_REFRESH_SEC window.
    g_demandFileMtime = TimeCurrent();
 
-   PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d v2 entries, %d v3 gap-fills",
-      g_demandCount, g_demandV2Count, g_gapFillCount);
+   PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d gap-fills",
+      g_demandCount, g_gapFillCount);
 }
 
 // v1.447: Decide whether to enter initial-burst mode.
@@ -919,7 +871,7 @@ int OnInit()
       #define INTEGRITY_BATCH_SIZE 20  // Commit every N symbols to release memory
       // Use configurable InitialBarCap (default 1000) — incremental sync fills the rest
 
-      // v1.447: Shared demand.txt loader — handles v1/v2/v3 formats.
+      // Shared demand.txt loader — v3 format only.
       LoadDemandFile(symCount);
 
       int batchCount = 0;
