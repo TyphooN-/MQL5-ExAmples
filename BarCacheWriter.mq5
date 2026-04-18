@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.460"
+#property version   "1.461"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.461: Gap-fill bypasses TF-period gating — previously the 80% gate at the top of the per-TF loop skipped rows before the gap-fill check, leaving D1/W1/MN1 gap requests unserviced (terminal looped on the same ~256 stale pairs). Now checks GetGapFillMaxBars first and short-circuits the gating when a request is pending."
 #property description "v1.460: DeleteStaleBarCacheRows — DELETE bar rows not refreshed in 14 days (metadata preserved) on same cycle as VACUUM so freed pages reclaim in one pass. Bounds /dev/shm growth when symbols leave the demand set or broker list."
 #property description "v1.459: Gap-fill uses IncrementalExportSymbolTF (merge) instead of capped ExportSymbolTF (replace). Preserves cached history; long gaps heal via v1.453 hole-detection full re-export — no data loss."
 #property description "v1.458: IntegrityCheck magic-byte check now covers all 4 TTBR bytes — previous partial 'TT' match could let a corrupted blob through and read garbage as the bar count. Matches the full-magic check already used in IncrementalExportSymbolTF."
@@ -767,7 +768,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.459\"}",
+      "\"version\":\"1.461\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1087,7 +1088,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.459: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.461: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1237,6 +1238,20 @@ void ExportAll()
 
       for(int tf = 0; tf < g_tfCount; tf++)
       {
+         // v1.461: Check for pending gap-fill request BEFORE the TF-period
+         // gate. Previously the gate at line ~1250 would `continue` on any
+         // TF whose last-export was <80% of the TF period ago — which
+         // dropped the gap-fill path for the ENTIRE remainder of the loop
+         // body. Symptom: terminal keeps re-requesting the same ~256
+         // stale (SYMBOL:TF) pairs cycle after cycle because BCW's log
+         // reads "0 exported, N skipped" on any TF where the gating
+         // rejected the row (common for D1/W1/MN1 where elapsed is
+         // almost always <80% of 24h/1wk/1mo). GetGapFillMaxBars has an
+         // O(1) early-bail when g_gapFillActive == 0, so this adds no
+         // steady-state overhead.
+         string trackKey = symbol + ":" + g_tfStrings[tf];
+         int gapBars = GetGapFillMaxBars(trackKey);
+
          // TF gating: skip TFs that can't have new bars yet.
          // If less than 80% of the TF period has elapsed since last export,
          // a new bar can't have formed. 80% threshold allows for early checks
@@ -1245,8 +1260,10 @@ void ExportAll()
          // H1 every ~48 min, D1 every ~19 hours, etc.
          // v1.447: Skip gating during initial-burst — we want to populate
          // every TF for demand symbols as fast as possible, not wait 4h for H4.
+         // v1.461: Skip gating when a gap-fill is pending so the request
+         // always gets serviced this cycle.
          int tfPeriod = g_tfPeriods[tf];
-         if(!g_initBurstActive && g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
+         if(gapBars == 0 && !g_initBurstActive && g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
          {
             int elapsed = (int)(cycleNow - g_tfLastExportTime[tf]);
             if(elapsed < (int)(tfPeriod * 0.8))
@@ -1256,7 +1273,6 @@ void ExportAll()
             }
          }
 
-         string trackKey = symbol + ":" + g_tfStrings[tf];
          int idx = GetTrackIndex(trackKey);
 
          // v1.447: Gap-fill request from terminal — force a sync and clear
@@ -1272,7 +1288,6 @@ void ExportAll()
          // bars onto the existing blob for short gaps, and its v1.453
          // hole-detection falls back to full re-export for long gaps —
          // both paths preserve all existing bars.
-         int gapBars = GetGapFillMaxBars(trackKey);
          if(gapBars > 0)
          {
             int done = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
