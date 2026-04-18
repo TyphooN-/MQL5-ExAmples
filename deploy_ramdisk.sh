@@ -76,7 +76,7 @@ if [ "${1:-}" = "--undo" ]; then
                 echo "  $name: removing demand.txt symlink ($demand_link)"
                 rm "$demand_link"
             fi
-        done < <(find "$inst/drive_c/users" -maxdepth 6 -type d -path "*/AppData/Roaming/MetaQuotes/Terminal/Common/Files" 2>/dev/null)
+        done < <(find "$inst/drive_c/users" -maxdepth 7 -type d -path "*/AppData/Roaming/MetaQuotes/Terminal/Common/Files" 2>/dev/null)
 
         if [ -f "$ramdisk_demand" ]; then
             echo "  $name: removing ramdisk demand.txt"
@@ -151,7 +151,7 @@ for name in $ACTIVE_INSTANCES; do
             continue
         fi
         echo "  $name: $demand_link → $ramdisk_demand"
-    done < <(find "$inst/drive_c/users" -maxdepth 6 -type d -path "*/AppData/Roaming/MetaQuotes/Terminal/Common/Files" 2>/dev/null)
+    done < <(find "$inst/drive_c/users" -maxdepth 7 -type d -path "*/AppData/Roaming/MetaQuotes/Terminal/Common/Files" 2>/dev/null)
 
     if [ "$demand_any" = 0 ]; then
         echo "  $name: Common/Files/ not found — start MT5 once to create it, then re-run"
