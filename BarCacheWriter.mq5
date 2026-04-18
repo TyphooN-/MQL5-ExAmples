@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.456"
+#property version   "1.457"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.457: Drop dead g_demandFileMtime + g_demandFilePath globals — mtime-change reload scheme was replaced by pure cycle cadence (every 2 cycles ~1 min) in v1.448, left orphaned state. Path now logged directly from the local in LoadDemandFile."
 #property description "v1.456: IntegrityCheck adds staleness detection — compares DB newest-bar ts_ms against MT5's latest bar and re-exports symbols where the cache is >2 TF periods behind. Catches outage scenarios (EA downtime, broker disconnect, account loss, /dev/shm stale persistence) that previously slipped through the dbCount<100 filter."
 #property description "v1.455: LoadDemandFile validates parts[0] is a symbol and parts[1] is a known TF — rejects rows whose symbol slot is accidentally a TF string (e.g. '1Hour:1Hour:0:1500') before they pollute g_demandSymbols and waste rotation cycles on non-existent broker symbols. Belt+suspenders for the terminal-side canonicalisation fix."
 #property description "v1.454: IncrementalExportSymbolTF reverse-order guard — if the newest fetched bar is strictly older than the cached last bar, force full re-export. Previously the merge loop would silently append older bars after the existing ones, producing a non-monotonic blob. Covers clock-skew, broker data switch, and bit-rot corruption."
@@ -83,11 +84,6 @@ int      g_gapFillCount = 0;
 // GetGapFillMaxBars can short-circuit without running a binary search —
 // which is the steady-state case for the 900 calls per ExportAll cycle.
 int      g_gapFillActive = 0;
-
-// v1.447: Re-read demand.txt when its mtime changes so gap-fill requests
-// written after OnInit get picked up without an EA restart.
-string   g_demandFilePath  = "";     // resolved at first load (account tag vs fallback)
-datetime g_demandFileMtime = 0;      // last-seen file modification time
 
 // v1.443 perf: O(1) demand-symbol membership check. Parallel array indexed by
 // the MT5 symbol index (SymbolName(i, MarketWatchOnly)). Rebuilt once at OnInit
@@ -572,11 +568,7 @@ void LoadDemandFile(int symCount)
       h = FileOpen(path, FILE_READ | FILE_ANSI | FILE_COMMON);
    }
    if(h == INVALID_HANDLE)
-   {
-      g_demandFilePath = "";
-      g_demandFileMtime = 0;
       return;
-   }
 
    while(!FileIsEnding(h))
    {
@@ -668,11 +660,8 @@ void LoadDemandFile(int symCount)
 
    RebuildDemandIndexBitmap(symCount);
 
-   g_demandFilePath = path;
-   g_demandFileMtime = TimeCurrent();
-
-   PrintFormat("BarCacheWriter: demand.txt loaded — %d symbols, %d gap-fills",
-      g_demandCount, g_gapFillCount);
+   PrintFormat("BarCacheWriter: demand.txt loaded from %s — %d symbols, %d gap-fills",
+      path, g_demandCount, g_gapFillCount);
 }
 
 // v1.447: Decide whether to enter initial-burst mode.
@@ -774,7 +763,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.456\"}",
+      "\"version\":\"1.457\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1090,7 +1079,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.456: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.457: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
