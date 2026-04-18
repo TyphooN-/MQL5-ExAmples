@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.461"
+#property version   "1.462"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.462: Shallow-cache redirect on gap-fill — when the terminal's gap-fill request asks for more bars than currently cached (integrity target: 100K for M1-H4, full history for D1/W1/MN1), route to ExportSymbolTF(maxBars=gapBars) instead of IncrementalExportSymbolTF. The incremental merge only APPENDS newer bars, so a fresh-but-shallow cache would otherwise never grow. New GetCachedBarCount helper reads the TTBR header for the decision."
 #property description "v1.461: Gap-fill bypasses TF-period gating — previously the 80% gate at the top of the per-TF loop skipped rows before the gap-fill check, leaving D1/W1/MN1 gap requests unserviced (terminal looped on the same ~256 stale pairs). Now checks GetGapFillMaxBars first and short-circuits the gating when a request is pending."
 #property description "v1.460: DeleteStaleBarCacheRows — DELETE bar rows not refreshed in 14 days (metadata preserved) on same cycle as VACUUM so freed pages reclaim in one pass. Bounds /dev/shm growth when symbols leave the demand set or broker list."
 #property description "v1.459: Gap-fill uses IncrementalExportSymbolTF (merge) instead of capped ExportSymbolTF (replace). Preserves cached history; long gaps heal via v1.453 hole-detection full re-export — no data loss."
@@ -535,6 +536,27 @@ int GetGapFillMaxBars(string symTf)
    return g_gapFillMaxBars[idx];
 }
 
+// v1.462: Read the cached bar count for a key without decoding the whole
+// blob. Reads the 8-byte TTBR header (4-byte magic + 4-byte LE count) via
+// the pre-prepared read statement. Returns 0 if the key is absent, the
+// blob header is malformed, or anything else goes wrong — callers treat
+// 0 as "empty/unknown cache" and fall through to the full-export path.
+// Hot path: called once per gap-fill hit inside ExportAll to decide
+// whether to merge or re-seed.
+int GetCachedBarCount(string trackKey)
+{
+   if(g_stmtBarRead == INVALID_HANDLE) return 0;
+   string cacheKey = "mt5:" + trackKey;
+   DatabaseReset(g_stmtBarRead);
+   DatabaseBind(g_stmtBarRead, 0, cacheKey);
+   if(!DatabaseRead(g_stmtBarRead)) return 0;
+   uchar hdr[];
+   DatabaseColumnBlob(g_stmtBarRead, 0, hdr);
+   if(ArraySize(hdr) < 8) return 0;
+   if(hdr[0] != 'T' || hdr[1] != 'T' || hdr[2] != 'B' || hdr[3] != 'R') return 0;
+   return (int)hdr[4] | ((int)hdr[5] << 8) | ((int)hdr[6] << 16) | ((int)hdr[7] << 24);
+}
+
 // Mark a gap-fill request as served so it isn't re-processed next cycle.
 // Called after a successful ExportSymbolTF on a gap-fill key. v1.450:
 // decrement the active counter on the 1→0 transition so the next lookup
@@ -768,7 +790,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.461\"}",
+      "\"version\":\"1.462\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -1088,7 +1110,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.461: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.462: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1288,9 +1310,26 @@ void ExportAll()
          // bars onto the existing blob for short gaps, and its v1.453
          // hole-detection falls back to full re-export for long gaps —
          // both paths preserve all existing bars.
+         //
+         // v1.462: Shallow-cache redirect — when the terminal's gap-fill
+         // request asks for MORE bars than currently cached (the
+         // integrity-coverage case: e.g. 5K D1 bars cached, terminal
+         // wants 100K for full history), route directly to ExportSymbolTF
+         // with the requested count. The incremental path only appends
+         // NEWER bars, so a fresh-but-shallow cache would otherwise
+         // never grow through normal operation. ExportSymbolTF at
+         // maxBars=gapBars fetches that many bars from the broker end
+         // (or all available, whichever is smaller) and re-seeds the
+         // blob, giving the terminal the deep history it asked for.
          if(gapBars > 0)
          {
-            int done = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
+            int existingCount = GetCachedBarCount(trackKey);
+            int done;
+            bool shallow = (existingCount > 0 && gapBars > existingCount);
+            if(shallow)
+               done = ExportSymbolTF(symbol, g_timeframes[tf], gapBars, g_tfStrings[tf]);
+            else
+               done = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
             if(done > 0)
             {
                exported++;
@@ -1304,7 +1343,8 @@ void ExportAll()
                   g_trackDirty[idx] = true;
                }
                ClearGapFill(trackKey);
-               PrintFormat("BarCacheWriter: gap-fill %s — merged to %d bars (req %d)", trackKey, done, gapBars);
+               PrintFormat("BarCacheWriter: gap-fill %s — %s to %d bars (req %d, had %d)",
+                  trackKey, shallow ? "re-seeded" : "merged", done, gapBars, existingCount);
                continue;
             }
             // Failed — fall through to normal path; ClearGapFill only on success.
