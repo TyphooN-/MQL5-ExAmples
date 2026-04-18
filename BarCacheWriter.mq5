@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.450"
+#property version   "1.451"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.451: CanExitInitialBurst binary search — replaces 3.15M string comparisons/cycle during burst with ~5800 (log2). Removes dead g_lastHeartbeatWrite variable."
 #property description "v1.450: Gap-fill early-bail via g_gapFillActive counter — skips the binary search in the 900-call/cycle hot path whenever no gap-fill request is outstanding (the steady-state case). Preserves v1.449 sort for when requests do arrive."
 #property description "v1.449: Gap-fill lookup binary search — replaces 256-entry linear scan in GetGapFillMaxBars/ClearGapFill (hot path, ~230K string comparisons/cycle → ~7K). LoadDemandFile sorts g_gapFill* arrays after populate."
 #property description "v1.448: demand.txt v3-only (SYMBOL:TF:LAST_TS:MAX_BARS) — drops dead v1 bare / v2 3-part branches in LoadDemandFile, simplifies parser, removes unused g_demandV2 arrays."
@@ -128,7 +129,6 @@ int      g_initBurstExitThresh = 100;  // min bars per demand:TF to count "popul
 // v1.447: Heartbeat — written at end of every ExportAll cycle so the terminal
 // can see writer liveness without parsing log files. Key is
 // `mt5:__HEARTBEAT__:{accountId}` stored as JSON text in bar_cache.data.
-datetime g_lastHeartbeatWrite = 0;
 
 
 // Safe transaction wrappers — handle dangling transactions from prior lock failures
@@ -716,25 +716,32 @@ bool CanExitInitialBurst()
 
    // For each demand symbol, confirm at least one of its TFs has progressed
    // past the "never synced" state (g_trackTimes > 0 and != FAIL_SENTINEL).
+   // v1.451: Binary search via BinarySearchKey instead of a linear scan of
+   // g_trackKeys[]. With ~50 demand symbols × 9 TFs × 7000 tracked keys, the
+   // old nested linear scan burned 3.15M string comparisons per burst-cycle
+   // call; binary search cuts that to ~5800. Falls back to linear while
+   // g_trackSorted=false (only true briefly during OnInit population).
    for(int s = 0; s < g_demandCount; s++)
    {
       bool anyReady = false;
       for(int t = 0; t < g_tfCount; t++)
       {
          string tk = g_demandSymbols[s] + ":" + g_tfStrings[t];
-         // Linear scan of track arrays — g_demandCount is small (~50-100),
-         // g_tfCount=9, runs once per cycle, O(demand × tf × track) is fine.
-         for(int i = 0; i < g_trackCount; i++)
+         int idx = -1;
+         if(g_trackSorted && g_trackCount > 0)
+            idx = BinarySearchKey(g_trackKeys, g_trackCount, tk);
+         else
          {
-            if(g_trackKeys[i] == tk
-               && g_trackTimes[i] > 0
-               && g_trackTimes[i] != (datetime)FAIL_SENTINEL)
-            {
-               anyReady = true;
-               break;
-            }
+            for(int i = 0; i < g_trackCount; i++)
+               if(g_trackKeys[i] == tk) { idx = i; break; }
          }
-         if(anyReady) break;
+         if(idx >= 0
+            && g_trackTimes[idx] > 0
+            && g_trackTimes[idx] != (datetime)FAIL_SENTINEL)
+         {
+            anyReady = true;
+            break;
+         }
       }
       if(!anyReady) return false;  // this symbol has no populated TF yet
    }
@@ -753,7 +760,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.450\"}",
+      "\"version\":\"1.451\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -765,7 +772,6 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
    DatabaseBind(g_stmtMetaInsert, 2, (long)now);
    DatabaseBind(g_stmtMetaInsert, 3, 0);
    DatabaseRead(g_stmtMetaInsert);
-   g_lastHeartbeatWrite = now;
 }
 
 int OnInit()
@@ -1019,7 +1025,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.450: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.451: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
