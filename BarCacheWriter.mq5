@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.457"
+#property version   "1.458"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.458: IntegrityCheck magic-byte check now covers all 4 TTBR bytes — previous partial 'TT' match could let a corrupted blob through and read garbage as the bar count. Matches the full-magic check already used in IncrementalExportSymbolTF."
 #property description "v1.457: Drop dead g_demandFileMtime + g_demandFilePath globals — mtime-change reload scheme was replaced by pure cycle cadence (every 2 cycles ~1 min) in v1.448, left orphaned state. Path now logged directly from the local in LoadDemandFile."
 #property description "v1.456: IntegrityCheck adds staleness detection — compares DB newest-bar ts_ms against MT5's latest bar and re-exports symbols where the cache is >2 TF periods behind. Catches outage scenarios (EA downtime, broker disconnect, account loss, /dev/shm stale persistence) that previously slipped through the dbCount<100 filter."
 #property description "v1.455: LoadDemandFile validates parts[0] is a symbol and parts[1] is a known TF — rejects rows whose symbol slot is accidentally a TF string (e.g. '1Hour:1Hour:0:1500') before they pollute g_demandSymbols and waste rotation cycles on non-existent broker symbols. Belt+suspenders for the terminal-side canonicalisation fix."
@@ -764,7 +765,7 @@ void WriteHeartbeat(int rotationOffset, int symCount, uint cycleMs, int exported
       "{\"ts\":%I64d,\"rotation_offset\":%d,\"sym_count\":%d,\"cycle_ms\":%u,"
       "\"init_burst_active\":%s,\"init_burst_cycles\":%d,\"cycle_count\":%d,"
       "\"exported\":%d,\"skipped\":%d,\"track_count\":%d,\"demand_count\":%d,"
-      "\"version\":\"1.457\"}",
+      "\"version\":\"1.458\"}",
       (long)now, rotationOffset, symCount, cycleMs,
       g_initBurstActive ? "true" : "false",
       g_initBurstCycles, g_cycleCount,
@@ -977,7 +978,11 @@ int OnInit()
                {
                   uchar tmpBlob[];
                   DatabaseColumnBlob(g_stmtBarRead, 0, tmpBlob);
-                  if(ArraySize(tmpBlob) >= 8 && tmpBlob[0] == 'T' && tmpBlob[1] == 'T')
+                  // Full TTBR magic check — partial "TT" match could pass a
+                  // corrupted blob (e.g. "TTxy") and read garbage as count.
+                  if(ArraySize(tmpBlob) >= 8
+                     && tmpBlob[0] == 'T' && tmpBlob[1] == 'T'
+                     && tmpBlob[2] == 'B' && tmpBlob[3] == 'R')
                   {
                      dbCount = (int)tmpBlob[4] | ((int)tmpBlob[5] << 8) | ((int)tmpBlob[6] << 16) | ((int)tmpBlob[7] << 24);
                      if(dbCount > 0)
@@ -1080,7 +1085,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.457: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
+   PrintFormat("BarCacheWriter v1.458: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
