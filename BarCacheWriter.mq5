@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.459"
+#property version   "1.460"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.460: DeleteStaleBarCacheRows — DELETE bar rows not refreshed in 14 days (metadata preserved) on same cycle as VACUUM so freed pages reclaim in one pass. Bounds /dev/shm growth when symbols leave the demand set or broker list."
 #property description "v1.459: Gap-fill uses IncrementalExportSymbolTF (merge) instead of capped ExportSymbolTF (replace). Preserves cached history; long gaps heal via v1.453 hole-detection full re-export — no data loss."
 #property description "v1.458: IntegrityCheck magic-byte check now covers all 4 TTBR bytes — previous partial 'TT' match could let a corrupted blob through and read garbage as the bar count. Matches the full-magic check already used in IncrementalExportSymbolTF."
 #property description "v1.457: Drop dead g_demandFileMtime + g_demandFilePath globals — mtime-change reload scheme was replaced by pure cycle cadence (every 2 cycles ~1 min) in v1.448, left orphaned state. Path now logged directly from the local in LoadDemandFile."
@@ -1409,9 +1410,15 @@ void ExportAll()
          PrintFormat("BarCacheWriter: flushed %d dirty track rows", flushed);
    }
 
-   // Periodic compact: VACUUM every ~2 hours to reclaim /dev/shm space
+   // Periodic compact: stale-row DELETE + VACUUM every ~2 hours to reclaim
+   // /dev/shm space. DELETE runs first so VACUUM reclaims its freed pages
+   // in the same pass (otherwise the pages sit on the free-list until the
+   // next VACUUM 2h later). 14-day retention covers long market closures
+   // while still evicting rows for symbols that have left the demand set
+   // or the broker's symbol list (old chart tabs, removed instruments).
    if(g_cycleCount % 240 == 0 && g_cycleCount > 0)
    {
+      DeleteStaleBarCacheRows(14 * 24 * 3600);
       uint vacStart = GetTickCount();
       DatabaseExecute(g_db, "VACUUM");
       PrintFormat("BarCacheWriter: VACUUM completed (%d ms)", GetTickCount() - vacStart);
@@ -1952,6 +1959,62 @@ int ExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, int maxBars, const string 
    }
 
    return copied;
+}
+
+// v1.460: Purge bar rows not refreshed in `retentionSec` seconds. Metadata
+// rows (mt5:__HEARTBEAT__, __SYMBOLS__, __SPECS__, __SERVER__) are preserved
+// via `NOT LIKE 'mt5:\_\_%' ESCAPE '\'` — SQLite's LIKE treats '_' as a
+// single-char wildcard by default, so the underscore-escape is mandatory.
+//
+// Same-connection DELETE avoids the cross-process lock cascade that forced
+// the terminal-side cleanup revert (d9ca7f5: terminal DELETE+VACUUM on the
+// source DB fought BCW's long-lived prepared statements and zeroed exports
+// across 797 symbols). Caller runs VACUUM immediately after this so the
+// freed pages return to the OS in one pass.
+//
+// Active symbols refresh timestamp on every new-bar write via
+// IncrementalExportSymbolTF. IncrementalExportSymbolTF's appendCount==0
+// path skips the DB write, so weekend/holiday gaps leave timestamp stale —
+// that's why retention is 14 days (covers long market closures without
+// clipping live symbols).
+void DeleteStaleBarCacheRows(long retentionSec)
+{
+   if(g_db == INVALID_HANDLE) return;
+   long cutoff = (long)TimeCurrent() - retentionSec;
+   if(cutoff <= 0) return;
+
+   long toDelete = 0;
+   string countSql = StringFormat(
+      "SELECT COUNT(*) FROM bar_cache "
+      "WHERE timestamp > 0 AND timestamp < %I64d "
+      "  AND key LIKE 'mt5:%%' "
+      "  AND key NOT LIKE 'mt5:\\_\\_%%' ESCAPE '\\'",
+      cutoff);
+   int cq = DatabasePrepare(g_db, countSql);
+   if(cq != INVALID_HANDLE)
+   {
+      if(DatabaseRead(cq))
+         DatabaseColumnLong(cq, 0, toDelete);
+      DatabaseFinalize(cq);
+   }
+
+   if(toDelete <= 0) return;
+
+   string delSql = StringFormat(
+      "DELETE FROM bar_cache "
+      "WHERE timestamp > 0 AND timestamp < %I64d "
+      "  AND key LIKE 'mt5:%%' "
+      "  AND key NOT LIKE 'mt5:\\_\\_%%' ESCAPE '\\'",
+      cutoff);
+
+   uint t0 = GetTickCount();
+   if(!DatabaseExecute(g_db, delSql))
+   {
+      PrintFormat("BarCacheWriter: stale-row cleanup failed (err %d)", GetLastError());
+      return;
+   }
+   PrintFormat("BarCacheWriter: cleaned %I64d stale rows (cutoff=%s, %d ms)",
+      toDelete, TimeToString((datetime)cutoff), GetTickCount() - t0);
 }
 
 void OnDeinit(const int reason)
