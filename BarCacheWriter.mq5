@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.470"
+#property version   "1.471"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.471: Stop the gap-fill→re-flag infinite loop. When IncrementalExportSymbolTF is called for a symbol whose broker side has no new bars since the last export (weekend/holiday stocks, quiet sessions), the function returned existingCount without writing anything — leaving bar_cache.timestamp frozen at its prior value. Mt5Sync's delta reader (get_cache_meta_since) saw the unchanged ts and skipped the row, the terminal's gap detector re-walked the bar_count mismatch, re-flagged the key, wrote a fresh demand.txt request, and the cycle repeated forever (observed: 1031 persistent requests, Mt5Sync reporting 0/0/999). Fix: advance bar_cache.timestamp via a pre-prepared row-level UPDATE (g_stmtBarTouchTs) on every appendCount<=0 branch, so 'freshly checked, nothing to add' propagates through Mt5Sync's ts filter and satisfies the terminal's freshness check. No blob rewrite, no metadata churn — just a single UPDATE bar_cache SET timestamp=?1 WHERE key=?2."
 #property description "v1.470: Fix 'cannot commit transaction - SQL statements in progress' on gap-fill + incremental paths. DatabaseRead on the shared g_stmtBarRead SELECT statement leaves the cursor in SQLITE_ROW state — SQLite then refuses any COMMIT on the connection until the statement is stepped to SQLITE_DONE or reset. GetCachedBarCount (v1.462+) and IncrementalExportSymbolTF both read one row and returned, so the batch COMMIT at the end of BatchSize symbols would fail whenever either path fired within the batch window (common: any gap-fill request, any incremental pull with an existing cache row). Explicitly DatabaseReset the cursor after extracting columns at all three g_stmtBarRead call sites. The data path was correct — the work completed — but the transaction rolled back, so the writes were silently discarded until the next cycle's full re-export."
 #property description "v1.469: Eliminate redundant metadata upserts. __SYMBOLS__ (7KB JSON of broker symbol names) and __SERVER__ (~60B server+company blob) were being rewritten with a fresh timestamp every 30s cycle. Nothing in the terminal reads __SYMBOLS__ — cached_mt5_symbols is derived from bar_cache keys — and __SERVER__ content is fixed after MT5 login. Mt5Sync's ts-based incremental merge treated the fresh ts as a change signal and re-merged the unchanged payload on every pass, costing ~7KB × 120 cycles/hour = ~840KB/hour of wasted target-side work per MT5 source. __SYMBOLS__ now uses two-tier dedup — fast skip on unchanged symCount within a 300s window (O(1), no SymbolName scan); slow path rebuilds the JSON and string-compares to the cached copy before upserting. __SERVER__ moves to a single OnInit write."
 #property description "v1.468: Demand-scoped live bid/ask loop. The terminal's only consumer of bid_ask rows is the chart-refresh loop (app.rs:92134), which discards every row whose symbol doesn't match an open chart — and chart symbols are always in the demand set. Writing quotes for all ~851 broker symbols every 60s was pure waste: ~800 SymbolInfoDouble pairs + ~800 DB upserts per cycle for rows nobody reads. Scope to g_demandSymbols[] (typically 20-50 entries) and fall back to full-sweep only when demand is empty (standalone EA with no terminal attached, or first cycle before demand.txt loads). Cuts bid_ask transaction cost from ~800 upserts/60s to ~25 upserts/60s, freeing Wine syscall budget for the bar rotation that follows."
@@ -75,6 +76,7 @@ int g_stmtBarRead = INVALID_HANDLE;         // Pre-prepared SELECT data FROM bar
 int g_stmtTrackInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bar_track
 int g_stmtQuoteInsert = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for bid_ask
 int g_stmtMetaInsert  = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE for metadata (specs/symbols/server)
+int g_stmtBarTouchTs  = INVALID_HANDLE;     // Pre-prepared UPDATE bar_cache SET timestamp=?1 WHERE key=?2 — v1.471 heartbeat-only
 string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 datetime g_specsLastDbWrite = 0;             // v1.443: When specs CSV was last persisted to DB (skip redundant writes)
@@ -1082,6 +1084,16 @@ int OnInit()
       "INSERT OR REPLACE INTO bar_cache (key, data, timestamp, bar_count) VALUES (?1, ?2, ?3, ?4)");
    if(g_stmtMetaInsert == INVALID_HANDLE)
       PrintFormat("BarCacheWriter: WARN — failed to prepare meta insert stmt (err %d)", GetLastError());
+
+   // v1.471: ts-only touch for gap-fill requests that yield no new bars.
+   // When broker returns existing data (weekend/holiday for stocks), skip
+   // the 4.8 MB blob rewrite but advance the timestamp column so the
+   // terminal's gap detector sees "freshly checked" and stops re-flagging
+   // the key as stale on every cycle.
+   g_stmtBarTouchTs = DatabasePrepare(g_db,
+      "UPDATE bar_cache SET timestamp = ?1 WHERE key = ?2");
+   if(g_stmtBarTouchTs == INVALID_HANDLE)
+      PrintFormat("BarCacheWriter: WARN — failed to prepare bar ts touch stmt (err %d)", GetLastError());
 
    // Cache TF strings + periods once — eliminates 7,659 switch evals and 7,659
    // PeriodSeconds() syscalls per tick inside the hot (symbol × tf) loop.
@@ -2130,11 +2142,28 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    int appendCount = newCopied - newStart;
    if(appendCount <= 0)
    {
-      // No new bars — skip the blob write entirely.
-      // The forming bar's close/high/low changes every tick but rewriting a 4.8MB
-      // blob for a 48-byte update is the #1 cause of Wine I/O contention.
+      // No new bars — skip the blob write but touch the timestamp column.
+      // The forming bar's close/high/low changes every tick but rewriting a
+      // 4.8MB blob for a 48-byte update is the #1 cause of Wine I/O contention.
       // The forming bar will be captured when the NEXT bar opens (appendCount > 0).
       // Bid/ask table already captures live prices for the watchlist.
+      //
+      // v1.471: advance `timestamp` via a row-level UPDATE so the terminal's
+      // gap detector sees the key as "freshly checked" and stops re-flagging
+      // it as stale. Without this touch, gap-fill requests from the terminal
+      // for weekend/holiday stocks loop forever — BCW returns existingCount,
+      // the caller clears the gap-fill slot, but the row's timestamp never
+      // advances, so next cycle the terminal re-adds the gap-fill request.
+      if(g_stmtBarTouchTs != INVALID_HANDLE)
+      {
+         DatabaseReset(g_stmtBarTouchTs);
+         if(DatabaseBind(g_stmtBarTouchTs, 0, (long)TimeCurrent()) &&
+            DatabaseBind(g_stmtBarTouchTs, 1, key))
+         {
+            DatabaseRead(g_stmtBarTouchTs);
+            DatabaseReset(g_stmtBarTouchTs);
+         }
+      }
       return existingCount;
    }
 
@@ -2322,6 +2351,7 @@ void OnDeinit(const int reason)
    if(g_stmtTrackInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtTrackInsert); g_stmtTrackInsert = INVALID_HANDLE; }
    if(g_stmtQuoteInsert != INVALID_HANDLE) { DatabaseFinalize(g_stmtQuoteInsert); g_stmtQuoteInsert = INVALID_HANDLE; }
    if(g_stmtMetaInsert != INVALID_HANDLE)  { DatabaseFinalize(g_stmtMetaInsert);  g_stmtMetaInsert = INVALID_HANDLE; }
+   if(g_stmtBarTouchTs != INVALID_HANDLE)  { DatabaseFinalize(g_stmtBarTouchTs);  g_stmtBarTouchTs = INVALID_HANDLE; }
    if(g_db != INVALID_HANDLE)
    {
       DatabaseClose(g_db);
