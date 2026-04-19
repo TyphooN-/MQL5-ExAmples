@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.466"
+#property version   "1.467"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.467: ShouldEnterInitialBurst switches bar_cache → bar_track count. The terminal's Mt5Sync now deletes merged bar_cache rows from the source /dev/shm DB on every sync pass (post-merge cleanup bounds tmpfs growth). Under the old bar_cache-based cold-start check, every EA re-attach on a warm/synced account would false-positive into burst mode and re-export everything. bar_track rows persist across post-sync deletes — terminal only touches bar_cache — so counting bar_track.last_bar_time > 0 (excluding FAIL_SENTINEL) cleanly distinguishes 'EA has never exported here' from 'terminal already merged + reclaimed'. Same 20% demand-floor heuristic, same 450-row absolute floor, just a different source table."
 #property description "v1.466: O(1) demand.txt reload + O(1) metadata gate. Replaces the v1.448 2-cycle (~60s) demand reload gate with a per-cycle mtime stat — FileGetInteger(FILE_MODIFY_DATE) is ~1 µs and returns a stable datetime, so LoadDemandFile now fires on the same tick the terminal rewrites demand.txt instead of up to 60s later. Worst-case gap-fill awareness latency drops from 60s → 0s when mtime changes between ticks (typical case ≤30s, bounded by OnTimer cadence). Also drops the v1.457-era 5-minute lastMetaWrite gate — the Rust terminal's O(1) Mt5Sync uses get_cache_meta_since(ts) to read only changed rows, so throttling metadata writes to reduce mtime churn is no longer needed and only delays fresh-symbol discovery by up to 300s."
 #property description "v1.465: Per-(sym,TF) TF gate + O(1) hot-loop lookups. Replaces per-TF-global g_tfLastExportTime[9] with g_trackLastExport[] parallel to g_trackTimes[], so the 80% TF-period gate now fires per (symbol,TF) pair instead of globally per TF — previously the first symbol exported in a TF updated the global timer, gating ALL other symbols on that TF for the next period and starving the rotation queue. Adds g_gapFillMaxBarsByMWIdx[symCount*tfCount] + g_trackIdxByMWIdx[symCount*tfCount] flat-array caches populated by RebuildSlotCaches (runs alongside RebuildDemandIndexBitmap on demand.txt reload / symCount change). Hot loop goes from O(log N) on every (symbol,TF) to O(1). Tiered MaxBarsForTF: 1Min/5Min=50K, 15Min/30Min=30K, 1Hour=30K, 4Hour=20K, 1Day+=10K — gives backtest-useful low-TF history without blowing up H4/D1+ cache size."
 #property description "v1.464: RamdiskMode input (default true) — when the DB lives on /dev/shm (deploy_ramdisk.sh), switch to journal_mode=MEMORY + synchronous=OFF. Eliminates SQLite's DELETE-mode journal file create/truncate on every BEGIN/COMMIT, which under Wine translates to a stream of NtCreateFile/NtWriteFile/NtDeleteFile syscalls that dominate ExportAll throughput. Safe on tmpfs (reboot wipes the DB anyway). IntegrityCheck catches any blob corrupted by mid-COMMIT crash on next startup. Non-ramdisk users set RamdiskMode=false to keep DELETE journal + sync=NORMAL for durability."
@@ -810,16 +811,24 @@ void LoadDemandFile(int symCount)
 // for minutes after /dev/shm clear. Burst mode bypasses rotation and
 // TF gating so demand symbols get filled sequentially at max speed.
 //
-// Heuristic: if fewer than 20% of (demandCount × tfCount) bar_cache rows
-// exist with bar_count >= g_initBurstExitThresh, we're in a cold-start
-// state. No demand list → check overall row count as proxy.
+// v1.467: Use bar_track (in-EA tracking state) instead of bar_cache to
+// detect cold-start. The terminal's Mt5Sync now deletes bar_cache rows
+// immediately after merging them into its target DB — under the old
+// bar_cache-based check, every EA re-attach on a well-synced account
+// would false-positive into burst mode and rewrite everything. bar_track
+// rows persist across post-sync deletes (terminal only touches bar_cache),
+// so counting bar_track.last_bar_time > 0 cleanly distinguishes "EA has
+// never exported here" (cold start) from "terminal has already merged +
+// cleaned" (warm state with empty bar_cache). FAIL_SENTINEL is excluded
+// so symbols the EA gave up on don't count as populated.
 bool ShouldEnterInitialBurst()
 {
    if(g_db == INVALID_HANDLE) return false;
 
    int req = DatabasePrepare(g_db,
-      "SELECT COUNT(*) FROM bar_cache WHERE bar_count >= 100");
+      "SELECT COUNT(*) FROM bar_track WHERE last_bar_time > 0 AND last_bar_time != ?1");
    if(req == INVALID_HANDLE) return false;
+   DatabaseBind(req, 0, (long)FAIL_SENTINEL);
    long populated = 0;
    if(DatabaseRead(req))
       DatabaseColumnLong(req, 0, populated);
@@ -831,7 +840,7 @@ bool ShouldEnterInitialBurst()
       int floor    = (int)(expected * 0.20);
       if(populated < floor)
       {
-         PrintFormat("BarCacheWriter: cold start — %I64d/%d populated keys < 20%% floor (%d); entering initial-burst mode",
+         PrintFormat("BarCacheWriter: cold start — %I64d/%d tracked keys < 20%% floor (%d); entering initial-burst mode",
             populated, expected, floor);
          return true;
       }
@@ -842,7 +851,7 @@ bool ShouldEnterInitialBurst()
       // is a reasonable warm threshold for generic installs.
       if(populated < 450)
       {
-         PrintFormat("BarCacheWriter: cold start — %I64d populated keys < 450; entering initial-burst mode",
+         PrintFormat("BarCacheWriter: cold start — %I64d tracked keys < 450; entering initial-burst mode",
             populated);
          return true;
       }
@@ -1257,7 +1266,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.465: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
+   PrintFormat("BarCacheWriter v1.467: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
