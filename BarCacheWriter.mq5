@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.472"
+#property version   "1.473"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.473: Transaction state tracking — g_inTxn mirrors BEGIN/COMMIT state so SafeCommit no-ops when no txn is active. Stops the 'database error, cannot commit – no transaction is active' + 'cannot rollback' two-line cascade that appeared whenever SQLite silently ended a transaction (oversized-blob auto-rollback, busy-timeout, journal truncation race) before our outer SafeCommit() reached it. Previously SafeCommit unconditionally called DatabaseTransactionCommit → prints 'cannot commit' error, then DatabaseExecute('ROLLBACK') → prints 'cannot rollback' error. Callers that ignored SafeBegin's return value (all non-FlushDirtyTrackTimes sites) also set inTxn=true even when begin failed, making the mismatch cumulative. Now: SafeBegin clears stale state + retries + sets g_inTxn on success; SafeCommit gates on g_inTxn and clears it BEFORE calling commit so a mid-commit failure leaves the flag consistent. Callers remain unchanged — wrappers are self-healing."
 #property description "v1.472: Bound the gap-fill cold-start blob. When a gap-fill request lands on a key with existingCount==0 (cache empty for that SYM:TF), the v1.462 shallow check gated on `existingCount > 0` fell into IncrementalExportSymbolTF, which for a hasExisting=false row recursed into ExportSymbolTF(maxBars=0) — CopyRates from 1970.01.01 → now, unbounded. For a liquid equity on 1Min this yields ~1.37M bars → ~65MB TTBR blob. MT5's DatabaseRead on that single INSERT pushes the SQLite journal past its commit threshold and the transaction is auto-rolled back before the next SafeCommit reaches it — observable as 'cannot commit - no transaction is active' immediately after 'gap-fill OLN:1Min merged to 1368961 bars (req 2929, had 0)', followed by the entire symbol batch rolling back. Fix: shallow = (gapBars > existingCount) so the 0-cached case routes to ExportSymbolTF(symbol, tf, gapBars, ...) — bounded by the terminal's actual request — instead of the incremental path's unbounded fallback. Defense-in-depth: the hasExisting=false / bad-magic / bad-count returns inside IncrementalExportSymbolTF are now capped at MAX_BARS_PER_KEY (100K) so any other path that still lands there can't revive the 65MB write."
 #property description "v1.471: Stop the gap-fill→re-flag infinite loop. When IncrementalExportSymbolTF is called for a symbol whose broker side has no new bars since the last export (weekend/holiday stocks, quiet sessions), the function returned existingCount without writing anything — leaving bar_cache.timestamp frozen at its prior value. Mt5Sync's delta reader (get_cache_meta_since) saw the unchanged ts and skipped the row, the terminal's gap detector re-walked the bar_count mismatch, re-flagged the key, wrote a fresh demand.txt request, and the cycle repeated forever (observed: 1031 persistent requests, Mt5Sync reporting 0/0/999). Fix: advance bar_cache.timestamp via a pre-prepared row-level UPDATE (g_stmtBarTouchTs) on every appendCount<=0 branch, so 'freshly checked, nothing to add' propagates through Mt5Sync's ts filter and satisfies the terminal's freshness check. No blob rewrite, no metadata churn — just a single UPDATE bar_cache SET timestamp=?1 WHERE key=?2."
 #property description "v1.470: Fix 'cannot commit transaction - SQL statements in progress' on gap-fill + incremental paths. DatabaseRead on the shared g_stmtBarRead SELECT statement leaves the cursor in SQLITE_ROW state — SQLite then refuses any COMMIT on the connection until the statement is stepped to SQLITE_DONE or reset. GetCachedBarCount (v1.462+) and IncrementalExportSymbolTF both read one row and returned, so the batch COMMIT at the end of BatchSize symbols would fail whenever either path fired within the batch window (common: any gap-fill request, any incremental pull with an existing cache row). Explicitly DatabaseReset the cursor after extracting columns at all three g_stmtBarRead call sites. The data path was correct — the work completed — but the transaction rolled back, so the writes were silently discarded until the next cycle's full re-export."
@@ -188,23 +189,49 @@ int      g_initBurstExitThresh = 100;  // min bars per demand:TF to count "popul
 // `mt5:__HEARTBEAT__:{accountId}` stored as JSON text in bar_cache.data.
 
 
-// Safe transaction wrappers — handle dangling transactions from prior lock failures
+// Safe transaction wrappers — handle dangling transactions from prior lock failures.
+// v1.473: g_inTxn mirrors the BEGIN/COMMIT state so SafeCommit can no-op when no
+// transaction is active. Without this, any event that silently ends a txn
+// (SQLite auto-rollback on oversized blob, journal truncation race, busy-timeout
+// on a shared statement) causes the next SafeCommit to print both
+// "cannot commit – no transaction is active" and "cannot rollback – ...".
+bool g_inTxn = false;
+
 bool SafeBegin()
 {
+   // If our flag says we're already in a txn, reset the state first — either
+   // SQLite still thinks it's open (previous SafeCommit was skipped/failed)
+   // or it was auto-ended and our flag is stale. Either way, starting with
+   // a clean slate is correct.
+   if(g_inTxn)
+   {
+      DatabaseExecute(g_db, "ROLLBACK"); // may print benign "no transaction" msg
+      g_inTxn = false;
+   }
    if(!DatabaseTransactionBegin(g_db))
    {
-      // Likely already in a transaction from a prior failed commit — rollback and retry
+      // SQLite rejected BEGIN — likely a stale txn we didn't track. Retry once.
       DatabaseExecute(g_db, "ROLLBACK");
-      return DatabaseTransactionBegin(g_db);
+      if(!DatabaseTransactionBegin(g_db))
+         return false;
    }
+   g_inTxn = true;
    return true;
 }
 
 bool SafeCommit()
 {
+   // No active transaction → nothing to commit. Silently succeed rather than
+   // let DatabaseTransactionCommit print "cannot commit – no transaction is active".
+   if(!g_inTxn) return true;
+   // Clear the flag BEFORE calling commit so a mid-commit failure still leaves
+   // our state consistent (no recursive rollback attempts).
+   g_inTxn = false;
    if(!DatabaseTransactionCommit(g_db))
    {
-      // Commit failed (lock timeout) — rollback to clear transaction state
+      // Commit failed (lock timeout, disk full, etc) — rollback to clear state.
+      // If SQLite already ended the txn, ROLLBACK will log a benign error but
+      // we've already cleared g_inTxn so no cascade.
       DatabaseExecute(g_db, "ROLLBACK");
       return false;
    }
