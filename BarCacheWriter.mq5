@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.468"
+#property version   "1.469"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.469: Eliminate redundant metadata upserts. __SYMBOLS__ (7KB JSON of broker symbol names) and __SERVER__ (~60B server+company blob) were being rewritten with a fresh timestamp every 30s cycle. Nothing in the terminal reads __SYMBOLS__ — cached_mt5_symbols is derived from bar_cache keys — and __SERVER__ content is fixed after MT5 login. Mt5Sync's ts-based incremental merge treated the fresh ts as a change signal and re-merged the unchanged payload on every pass, costing ~7KB × 120 cycles/hour = ~840KB/hour of wasted target-side work per MT5 source. __SYMBOLS__ now uses two-tier dedup — fast skip on unchanged symCount within a 300s window (O(1), no SymbolName scan); slow path rebuilds the JSON and string-compares to the cached copy before upserting. __SERVER__ moves to a single OnInit write."
 #property description "v1.468: Demand-scoped live bid/ask loop. The terminal's only consumer of bid_ask rows is the chart-refresh loop (app.rs:92134), which discards every row whose symbol doesn't match an open chart — and chart symbols are always in the demand set. Writing quotes for all ~851 broker symbols every 60s was pure waste: ~800 SymbolInfoDouble pairs + ~800 DB upserts per cycle for rows nobody reads. Scope to g_demandSymbols[] (typically 20-50 entries) and fall back to full-sweep only when demand is empty (standalone EA with no terminal attached, or first cycle before demand.txt loads). Cuts bid_ask transaction cost from ~800 upserts/60s to ~25 upserts/60s, freeing Wine syscall budget for the bar rotation that follows."
 #property description "v1.467: ShouldEnterInitialBurst switches bar_cache → bar_track count. The terminal's Mt5Sync now deletes merged bar_cache rows from the source /dev/shm DB on every sync pass (post-merge cleanup bounds tmpfs growth). Under the old bar_cache-based cold-start check, every EA re-attach on a warm/synced account would false-positive into burst mode and re-export everything. bar_track rows persist across post-sync deletes — terminal only touches bar_cache — so counting bar_track.last_bar_time > 0 (excluding FAIL_SENTINEL) cleanly distinguishes 'EA has never exported here' from 'terminal already merged + reclaimed'. Same 20% demand-floor heuristic, same 450-row absolute floor, just a different source table."
 #property description "v1.466: O(1) demand.txt reload + O(1) metadata gate. Replaces the v1.448 2-cycle (~60s) demand reload gate with a per-cycle mtime stat — FileGetInteger(FILE_MODIFY_DATE) is ~1 µs and returns a stable datetime, so LoadDemandFile now fires on the same tick the terminal rewrites demand.txt instead of up to 60s later. Worst-case gap-fill awareness latency drops from 60s → 0s when mtime changes between ticks (typical case ≤30s, bounded by OnTimer cadence). Also drops the v1.457-era 5-minute lastMetaWrite gate — the Rust terminal's O(1) Mt5Sync uses get_cache_meta_since(ts) to read only changed rows, so throttling metadata writes to reduce mtime churn is no longer needed and only delays fresh-symbol discovery by up to 300s."
@@ -76,6 +77,24 @@ int g_stmtMetaInsert  = INVALID_HANDLE;     // Pre-prepared INSERT OR REPLACE fo
 string g_cachedSpecsCsv = "";                // Cached specs CSV (avoid rebuilding every 5min)
 datetime g_specsLastBuild = 0;               // When specs CSV was last rebuilt
 datetime g_specsLastDbWrite = 0;             // v1.443: When specs CSV was last persisted to DB (skip redundant writes)
+// v1.469: Symbol list content dedup. __SYMBOLS__ is a ~7KB JSON array of
+// broker symbol names; nothing in the terminal consumes it (cached_mt5_symbols
+// is derived from bar_cache keys, not this row), so writing it every 30s just
+// burns a BCW upsert + re-triggers Mt5Sync to merge the unchanged payload
+// on every pass. Two-tier dedup:
+//   - Fast skip: symCount unchanged AND <300 s since last successful write →
+//     return immediately (no SymbolName scan, no JSON rebuild).
+//   - Slow path (every 300 s, or on symCount change): rebuild the JSON and
+//     compare to the cached copy. Only upsert when the bytes actually differ.
+// 300 s bounds the "symbol swap at equal count" worst-case detection window
+// — broker adds/removes typically bump symCount and trigger immediate rebuild.
+string g_cachedSymbolsJson = "";
+datetime g_symbolsLastDbWrite = 0;
+int    g_symbolsLastCount = -1;
+// v1.469: __SERVER__ row is written once in OnInit; its content (server +
+// company) is fixed after MT5 login. Previously rewritten every cycle
+// alongside __SYMBOLS__ with a fresh timestamp, which Mt5Sync saw as a
+// change and re-merged unchanged bytes every pass.
 
 // Demand symbols — loaded from demand.txt in OnInit, used in ExportAll.
 // v3 format only: every line is SYMBOL:TF:LAST_TS_MS:MAX_BARS. MAX_BARS=0
@@ -1077,6 +1096,10 @@ int OnInit()
       g_isCFDServer ? "CFD (forex enabled)" : "Crypto/Futures (forex SKIPPED)",
       g_isCFDServer ? "found" : "not found");
 
+   // v1.469: Write __SERVER__ metadata row once — content is fixed after
+   // login, so the per-cycle rewrite was pure Mt5Sync re-merge churn.
+   WriteServerOnce();
+
    // Restore tracking state from DB — survive restarts without re-exporting everything
    if(ForceReExport)
    {
@@ -1267,7 +1290,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.468: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
+   PrintFormat("BarCacheWriter v1.469: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1729,7 +1752,17 @@ void ExportAll()
 
 void WriteSymbolList(int symCount)
 {
-   // Build symbol list as JSON array — O(n) via per-element array, single join
+   // v1.469: Fast skip — same symCount + recent write → nothing to do.
+   datetime tc = TimeCurrent();
+   if(g_symbolsLastCount == symCount
+      && g_symbolsLastDbWrite > 0
+      && tc - g_symbolsLastDbWrite < 300
+      && StringLen(g_cachedSymbolsJson) > 0)
+   {
+      return;
+   }
+
+   // Rebuild JSON — O(n) via per-element array, single join.
    string names[];
    ArrayResize(names, symCount);
    int count = 0;
@@ -1740,12 +1773,10 @@ void WriteSymbolList(int symCount)
       names[count++] = s;
    }
 
-   // Estimate total bytes: each symbol ~8 chars + quotes + comma + brackets
-   int totalLen = 2; // []
+   int totalLen = 2;
    for(int i = 0; i < count; i++)
-      totalLen += StringLen(names[i]) + 3; // "X",
+      totalLen += StringLen(names[i]) + 3;
 
-   // Build JSON array via uchar buffer — O(n) total, no quadratic string growth
    uchar buf[];
    ArrayResize(buf, totalLen + 1);
    int pos = 0;
@@ -1763,30 +1794,46 @@ void WriteSymbolList(int symCount)
    buf[pos++] = ']';
    string csv = CharArrayToString(buf, 0, pos, CP_UTF8);
 
-   // Use pre-prepared statement for metadata writes
+   // Content dedup — if the rebuilt JSON matches the cache, skip the upsert
+   // but refresh the fast-skip deadline so we don't re-rebuild every cycle.
+   if(csv == g_cachedSymbolsJson && g_symbolsLastCount == count)
+   {
+      g_symbolsLastDbWrite = tc;
+      return;
+   }
+
+   g_cachedSymbolsJson  = csv;
+   g_symbolsLastCount   = count;
+   g_symbolsLastDbWrite = tc;
+
    if(g_stmtMetaInsert != INVALID_HANDLE)
    {
       DatabaseReset(g_stmtMetaInsert);
       DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SYMBOLS__:" + g_accountTag);
       DatabaseBind(g_stmtMetaInsert, 1, csv);
-      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
-      DatabaseBind(g_stmtMetaInsert, 3, (long)symCount);
+      DatabaseBind(g_stmtMetaInsert, 2, (long)tc);
+      DatabaseBind(g_stmtMetaInsert, 3, (long)count);
       DatabaseRead(g_stmtMetaInsert);
    }
+}
 
-   // Store broker/server identity — TyphooN-Terminal reads this for data source badge
-   if(g_stmtMetaInsert != INVALID_HANDLE)
-   {
-      string server = AccountInfoString(ACCOUNT_SERVER);
-      string company = AccountInfoString(ACCOUNT_COMPANY);
-      string meta = "{\"server\":\"" + server + "\",\"company\":\"" + company + "\"}";
-      DatabaseReset(g_stmtMetaInsert);
-      DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SERVER__:" + g_accountTag);
-      DatabaseBind(g_stmtMetaInsert, 1, meta);
-      DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
-      DatabaseBind(g_stmtMetaInsert, 3, 0);
-      DatabaseRead(g_stmtMetaInsert);
-   }
+// v1.469: Write the __SERVER__ metadata row once. Server + company strings
+// are fixed for the duration of an MT5 login session, so there's no reason
+// to re-upsert every cycle — doing so would just keep Mt5Sync re-merging
+// identical bytes on every pass. Called from OnInit after g_accountTag is
+// populated and the pre-prepared meta insert is ready.
+void WriteServerOnce()
+{
+   if(g_stmtMetaInsert == INVALID_HANDLE) return;
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   string company = AccountInfoString(ACCOUNT_COMPANY);
+   string meta = "{\"server\":\"" + server + "\",\"company\":\"" + company + "\"}";
+   DatabaseReset(g_stmtMetaInsert);
+   DatabaseBind(g_stmtMetaInsert, 0, "mt5:__SERVER__:" + g_accountTag);
+   DatabaseBind(g_stmtMetaInsert, 1, meta);
+   DatabaseBind(g_stmtMetaInsert, 2, (long)TimeCurrent());
+   DatabaseBind(g_stmtMetaInsert, 3, 0);
+   DatabaseRead(g_stmtMetaInsert);
 }
 
 void WriteSymbolSpecs(int symCount)
