@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.465"
+#property version   "1.466"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.466: O(1) demand.txt reload + O(1) metadata gate. Replaces the v1.448 2-cycle (~60s) demand reload gate with a per-cycle mtime stat — FileGetInteger(FILE_MODIFY_DATE) is ~1 µs and returns a stable datetime, so LoadDemandFile now fires on the same tick the terminal rewrites demand.txt instead of up to 60s later. Worst-case gap-fill awareness latency drops from 60s → 0s when mtime changes between ticks (typical case ≤30s, bounded by OnTimer cadence). Also drops the v1.457-era 5-minute lastMetaWrite gate — the Rust terminal's O(1) Mt5Sync uses get_cache_meta_since(ts) to read only changed rows, so throttling metadata writes to reduce mtime churn is no longer needed and only delays fresh-symbol discovery by up to 300s."
 #property description "v1.465: Per-(sym,TF) TF gate + O(1) hot-loop lookups. Replaces per-TF-global g_tfLastExportTime[9] with g_trackLastExport[] parallel to g_trackTimes[], so the 80% TF-period gate now fires per (symbol,TF) pair instead of globally per TF — previously the first symbol exported in a TF updated the global timer, gating ALL other symbols on that TF for the next period and starving the rotation queue. Adds g_gapFillMaxBarsByMWIdx[symCount*tfCount] + g_trackIdxByMWIdx[symCount*tfCount] flat-array caches populated by RebuildSlotCaches (runs alongside RebuildDemandIndexBitmap on demand.txt reload / symCount change). Hot loop goes from O(log N) on every (symbol,TF) to O(1). Tiered MaxBarsForTF: 1Min/5Min=50K, 15Min/30Min=30K, 1Hour=30K, 4Hour=20K, 1Day+=10K — gives backtest-useful low-TF history without blowing up H4/D1+ cache size."
 #property description "v1.464: RamdiskMode input (default true) — when the DB lives on /dev/shm (deploy_ramdisk.sh), switch to journal_mode=MEMORY + synchronous=OFF. Eliminates SQLite's DELETE-mode journal file create/truncate on every BEGIN/COMMIT, which under Wine translates to a stream of NtCreateFile/NtWriteFile/NtDeleteFile syscalls that dominate ExportAll throughput. Safe on tmpfs (reboot wipes the DB anyway). IntegrityCheck catches any blob corrupted by mid-COMMIT crash on next startup. Non-ramdisk users set RamdiskMode=false to keep DELETE journal + sync=NORMAL for durability."
 #property description "v1.463: Startup integrity exports broker's full available history (min(mt5Count, MaxBarsForTF)) instead of the old InitialBarCap=1000 fast-restart limit. Matches the terminal's integrity target; avoids the ~30 s window where v1.462's shallow-redirect fills the gap between a 1000-bar startup stub and the 100K target."
@@ -1276,15 +1277,25 @@ void ExportAll()
 
    g_cycleCount++;
 
-   // v1.448: Periodic demand.txt refresh — every 2 cycles (~1 min at 30s
-   // interval). Previously 10 cycles (~5 min) which meant a newly-opened
-   // chart tab could wait up to 5 min for its gap-fill request to land,
-   // on top of the rotation-queue latency before the EA services it.
-   // The file is <10KB and the reload is ~1ms on /dev/shm — cost is
-   // negligible compared to the responsiveness win.
-   if(g_cycleCount % 2 == 0)
+   // v1.466: O(1) mtime-gated demand.txt reload. FileGetInteger is ~1 µs
+   // per file; we stat both the per-account and shared paths and take
+   // the max mtime as the demand-state signature. Reload only fires
+   // when the signature changes — the typical Rust-terminal hash-dedup
+   // flush means mtime only bumps when content actually changes.
+   // Dropped the v1.448 2-cycle gate: it added up to 30s of latency on
+   // every demand.txt change for no benefit now that the reload itself
+   // is gated by mtime. `lastDemandMtime == 0` bootstrap covers the
+   // cold-attach case where demand.txt pre-exists EA launch.
    {
-      LoadDemandFile(SymbolsTotal(MarketWatchOnly));
+      static long lastDemandMtime = 0;
+      long acctMtime = (long)FileGetInteger(g_accountTag + "_demand.txt", FILE_MODIFY_DATE, true);
+      long sharedMtime = (long)FileGetInteger("demand.txt", FILE_MODIFY_DATE, true);
+      long curMtime = acctMtime > sharedMtime ? acctMtime : sharedMtime;
+      if(curMtime != 0 && curMtime != lastDemandMtime)
+      {
+         LoadDemandFile(SymbolsTotal(MarketWatchOnly));
+         lastDemandMtime = curMtime;
+      }
    }
 
    // Periodic maintenance: every 60 cycles (~30 minutes at 30s interval).
@@ -1311,17 +1322,18 @@ void ExportAll()
 
    int exported = 0, skipped = 0, totalBars = 0;
 
-   // Write metadata only every 5 minutes (not every tick) — avoids unnecessary DB writes
-   // that change file mtime and prevent the Rust sync's fast-path mtime check
-   static datetime lastMetaWrite = 0;
-   if(lastMetaWrite == 0 || cycleNow - lastMetaWrite >= 300)
-   {
-      SafeBegin();
-      WriteSymbolList(symCount);
-      WriteSymbolSpecs(symCount);
-      SafeCommit();
-      lastMetaWrite = cycleNow;
-   }
+   // v1.466: Metadata written every cycle. The old 5-min gate existed
+   // to suppress mtime bumps that would defeat the Rust sync's mtime
+   // fast-path skip. That fast-path is gone — the Rust side now uses
+   // get_cache_meta_since(ts), which reads only changed rows regardless
+   // of mtime. The gate's only remaining effect was to delay fresh-symbol
+   // discovery by up to 300s. Dropping it propagates broker symbol-list
+   // changes within 30s. Re-copy cost on the Rust side is ≤5 mt5:__
+   // metadata keys per pass — trivial versus the responsiveness win.
+   SafeBegin();
+   WriteSymbolList(symCount);
+   WriteSymbolSpecs(symCount);
+   SafeCommit();
    uint afterMeta = GetTickCount();
    if(afterMeta - tickStart > 1000)
       PrintFormat("  metadata took %d ms", afterMeta - tickStart);
