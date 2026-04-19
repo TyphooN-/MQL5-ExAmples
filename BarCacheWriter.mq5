@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.469"
+#property version   "1.470"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.470: Fix 'cannot commit transaction - SQL statements in progress' on gap-fill + incremental paths. DatabaseRead on the shared g_stmtBarRead SELECT statement leaves the cursor in SQLITE_ROW state — SQLite then refuses any COMMIT on the connection until the statement is stepped to SQLITE_DONE or reset. GetCachedBarCount (v1.462+) and IncrementalExportSymbolTF both read one row and returned, so the batch COMMIT at the end of BatchSize symbols would fail whenever either path fired within the batch window (common: any gap-fill request, any incremental pull with an existing cache row). Explicitly DatabaseReset the cursor after extracting columns at all three g_stmtBarRead call sites. The data path was correct — the work completed — but the transaction rolled back, so the writes were silently discarded until the next cycle's full re-export."
 #property description "v1.469: Eliminate redundant metadata upserts. __SYMBOLS__ (7KB JSON of broker symbol names) and __SERVER__ (~60B server+company blob) were being rewritten with a fresh timestamp every 30s cycle. Nothing in the terminal reads __SYMBOLS__ — cached_mt5_symbols is derived from bar_cache keys — and __SERVER__ content is fixed after MT5 login. Mt5Sync's ts-based incremental merge treated the fresh ts as a change signal and re-merged the unchanged payload on every pass, costing ~7KB × 120 cycles/hour = ~840KB/hour of wasted target-side work per MT5 source. __SYMBOLS__ now uses two-tier dedup — fast skip on unchanged symCount within a 300s window (O(1), no SymbolName scan); slow path rebuilds the JSON and string-compares to the cached copy before upserting. __SERVER__ moves to a single OnInit write."
 #property description "v1.468: Demand-scoped live bid/ask loop. The terminal's only consumer of bid_ask rows is the chart-refresh loop (app.rs:92134), which discards every row whose symbol doesn't match an open chart — and chart symbols are always in the demand set. Writing quotes for all ~851 broker symbols every 60s was pure waste: ~800 SymbolInfoDouble pairs + ~800 DB upserts per cycle for rows nobody reads. Scope to g_demandSymbols[] (typically 20-50 entries) and fall back to full-sweep only when demand is empty (standalone EA with no terminal attached, or first cycle before demand.txt loads). Cuts bid_ask transaction cost from ~800 upserts/60s to ~25 upserts/60s, freeing Wine syscall budget for the bar rotation that follows."
 #property description "v1.467: ShouldEnterInitialBurst switches bar_cache → bar_track count. The terminal's Mt5Sync now deletes merged bar_cache rows from the source /dev/shm DB on every sync pass (post-merge cleanup bounds tmpfs growth). Under the old bar_cache-based cold-start check, every EA re-attach on a warm/synced account would false-positive into burst mode and re-export everything. bar_track rows persist across post-sync deletes — terminal only touches bar_cache — so counting bar_track.last_bar_time > 0 (excluding FAIL_SENTINEL) cleanly distinguishes 'EA has never exported here' from 'terminal already merged + reclaimed'. Same 20% demand-floor heuristic, same 450-row absolute floor, just a different source table."
@@ -627,9 +628,15 @@ int GetCachedBarCount(string trackKey)
    if(!DatabaseRead(g_stmtBarRead)) return 0;
    uchar hdr[];
    DatabaseColumnBlob(g_stmtBarRead, 0, hdr);
-   if(ArraySize(hdr) < 8) return 0;
-   if(hdr[0] != 'T' || hdr[1] != 'T' || hdr[2] != 'B' || hdr[3] != 'R') return 0;
-   return (int)hdr[4] | ((int)hdr[5] << 8) | ((int)hdr[6] << 16) | ((int)hdr[7] << 24);
+   // v1.470: close the cursor before returning. DatabaseRead on a SELECT
+   // leaves the statement in SQLITE_ROW state; the outer batch COMMIT then
+   // fails with "cannot commit transaction - SQL statements in progress"
+   // because a prepared statement is still stepping.
+   int count = 0;
+   if(ArraySize(hdr) >= 8 && hdr[0] == 'T' && hdr[1] == 'T' && hdr[2] == 'B' && hdr[3] == 'R')
+      count = (int)hdr[4] | ((int)hdr[5] << 8) | ((int)hdr[6] << 16) | ((int)hdr[7] << 24);
+   DatabaseReset(g_stmtBarRead);
+   return count;
 }
 
 // Mark a gap-fill request as served so it isn't re-processed next cycle.
@@ -1193,6 +1200,11 @@ int OnInit()
                      }
                   }
                }
+               // v1.470: close the cursor after extracting — DatabaseRead
+               // leaves SELECTs in SQLITE_ROW state, which would block any
+               // subsequent COMMIT. Pre-transaction here, but keep the
+               // pattern uniform across all g_stmtBarRead call sites.
+               DatabaseReset(g_stmtBarRead);
             }
             checkedCount++;
 
@@ -1290,7 +1302,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.469: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
+   PrintFormat("BarCacheWriter v1.470: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -2033,6 +2045,10 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
       DatabaseColumnBlob(g_stmtBarRead, 0, existingBlob);
       hasExisting = (ArraySize(existingBlob) >= 8);
    }
+   // v1.470: close the cursor so the outer batch COMMIT isn't blocked by
+   // a statement stuck in SQLITE_ROW state. DatabaseRead only steps once;
+   // the explicit reset here releases the cursor before any other DB work.
+   DatabaseReset(g_stmtBarRead);
 
    if(!hasExisting)
       return ExportSymbolTF(symbol, tf, 0, tfStr);
