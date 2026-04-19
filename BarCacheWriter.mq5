@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.467"
+#property version   "1.468"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.468: Demand-scoped live bid/ask loop. The terminal's only consumer of bid_ask rows is the chart-refresh loop (app.rs:92134), which discards every row whose symbol doesn't match an open chart — and chart symbols are always in the demand set. Writing quotes for all ~851 broker symbols every 60s was pure waste: ~800 SymbolInfoDouble pairs + ~800 DB upserts per cycle for rows nobody reads. Scope to g_demandSymbols[] (typically 20-50 entries) and fall back to full-sweep only when demand is empty (standalone EA with no terminal attached, or first cycle before demand.txt loads). Cuts bid_ask transaction cost from ~800 upserts/60s to ~25 upserts/60s, freeing Wine syscall budget for the bar rotation that follows."
 #property description "v1.467: ShouldEnterInitialBurst switches bar_cache → bar_track count. The terminal's Mt5Sync now deletes merged bar_cache rows from the source /dev/shm DB on every sync pass (post-merge cleanup bounds tmpfs growth). Under the old bar_cache-based cold-start check, every EA re-attach on a warm/synced account would false-positive into burst mode and re-export everything. bar_track rows persist across post-sync deletes — terminal only touches bar_cache — so counting bar_track.last_bar_time > 0 (excluding FAIL_SENTINEL) cleanly distinguishes 'EA has never exported here' from 'terminal already merged + reclaimed'. Same 20% demand-floor heuristic, same 450-row absolute floor, just a different source table."
 #property description "v1.466: O(1) demand.txt reload + O(1) metadata gate. Replaces the v1.448 2-cycle (~60s) demand reload gate with a per-cycle mtime stat — FileGetInteger(FILE_MODIFY_DATE) is ~1 µs and returns a stable datetime, so LoadDemandFile now fires on the same tick the terminal rewrites demand.txt instead of up to 60s later. Worst-case gap-fill awareness latency drops from 60s → 0s when mtime changes between ticks (typical case ≤30s, bounded by OnTimer cadence). Also drops the v1.457-era 5-minute lastMetaWrite gate — the Rust terminal's O(1) Mt5Sync uses get_cache_meta_since(ts) to read only changed rows, so throttling metadata writes to reduce mtime churn is no longer needed and only delays fresh-symbol discovery by up to 300s."
 #property description "v1.465: Per-(sym,TF) TF gate + O(1) hot-loop lookups. Replaces per-TF-global g_tfLastExportTime[9] with g_trackLastExport[] parallel to g_trackTimes[], so the 80% TF-period gate now fires per (symbol,TF) pair instead of globally per TF — previously the first symbol exported in a TF updated the global timer, gating ALL other symbols on that TF for the next period and starving the rotation queue. Adds g_gapFillMaxBarsByMWIdx[symCount*tfCount] + g_trackIdxByMWIdx[symCount*tfCount] flat-array caches populated by RebuildSlotCaches (runs alongside RebuildDemandIndexBitmap on demand.txt reload / symCount change). Hot loop goes from O(log N) on every (symbol,TF) to O(1). Tiered MaxBarsForTF: 1Min/5Min=50K, 15Min/30Min=30K, 1Hour=30K, 4Hour=20K, 1Day+=10K — gives backtest-useful low-TF history without blowing up H4/D1+ cache size."
@@ -1266,7 +1267,7 @@ int OnInit()
    g_initBurstActive = ShouldEnterInitialBurst();
    g_initBurstCycles = 0;
 
-   PrintFormat("BarCacheWriter v1.467: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
+   PrintFormat("BarCacheWriter v1.468: %s symbols(%d), %ds interval, batch=%d, %d cached keys, 16MB cache, forex=%s, integrity=%s, initCap=%d, ramdisk=%s, burst=%s",
       MarketWatchOnly ? "MW" : "ALL", initSymCount, UpdateIntervalSec, BatchSize, g_trackCount,
       g_isCFDServer ? "ENABLED" : "SKIPPED",
       IntegrityCheck ? "ON" : "OFF",
@@ -1349,6 +1350,10 @@ void ExportAll()
 
    // Live bid/ask sync — every OTHER cycle (60s) to align with 1-min bar writes
    // v1.441: reduced from every cycle to every 2nd — matches M1 bar frequency
+   // v1.468: demand-scoped. Terminal's chart-refresh path is the only consumer
+   // and it drops every row whose symbol isn't an open chart — chart symbols
+   // are always in demand. Full-sweep fallback kept for standalone EA deploys
+   // (no terminal attached → demand.txt never arrives).
    static int quoteSkip = 0;
    quoteSkip++;
    if(g_stmtQuoteInsert != INVALID_HANDLE && quoteSkip % 2 == 0)
@@ -1356,21 +1361,42 @@ void ExportAll()
       SafeBegin();
       long now = (long)cycleNow;
       int quoteCount = 0;
-      for(int q = 0; q < symCount; q++)
+      if(g_demandCount > 0)
       {
-         string qSym = SymbolName(q, MarketWatchOnly);
-         if(StringLen(qSym) == 0) continue;
-         double bid = SymbolInfoDouble(qSym, SYMBOL_BID);
-         double ask = SymbolInfoDouble(qSym, SYMBOL_ASK);
-         if(bid <= 0 && ask <= 0) continue;
-         double spread = (ask > 0 && bid > 0) ? (ask - bid) : 0;
-         DatabaseReset(g_stmtQuoteInsert);
-         DatabaseBind(g_stmtQuoteInsert, 0, qSym);
-         DatabaseBind(g_stmtQuoteInsert, 1, bid);
-         DatabaseBind(g_stmtQuoteInsert, 2, ask);
-         DatabaseBind(g_stmtQuoteInsert, 3, spread);
-         DatabaseBind(g_stmtQuoteInsert, 4, now);
-         if(DatabaseRead(g_stmtQuoteInsert)) quoteCount++;
+         for(int d = 0; d < g_demandCount; d++)
+         {
+            string qSym = g_demandSymbols[d];
+            double bid = SymbolInfoDouble(qSym, SYMBOL_BID);
+            double ask = SymbolInfoDouble(qSym, SYMBOL_ASK);
+            if(bid <= 0 && ask <= 0) continue;
+            double spread = (ask > 0 && bid > 0) ? (ask - bid) : 0;
+            DatabaseReset(g_stmtQuoteInsert);
+            DatabaseBind(g_stmtQuoteInsert, 0, qSym);
+            DatabaseBind(g_stmtQuoteInsert, 1, bid);
+            DatabaseBind(g_stmtQuoteInsert, 2, ask);
+            DatabaseBind(g_stmtQuoteInsert, 3, spread);
+            DatabaseBind(g_stmtQuoteInsert, 4, now);
+            if(DatabaseRead(g_stmtQuoteInsert)) quoteCount++;
+         }
+      }
+      else
+      {
+         for(int q = 0; q < symCount; q++)
+         {
+            string qSym = SymbolName(q, MarketWatchOnly);
+            if(StringLen(qSym) == 0) continue;
+            double bid = SymbolInfoDouble(qSym, SYMBOL_BID);
+            double ask = SymbolInfoDouble(qSym, SYMBOL_ASK);
+            if(bid <= 0 && ask <= 0) continue;
+            double spread = (ask > 0 && bid > 0) ? (ask - bid) : 0;
+            DatabaseReset(g_stmtQuoteInsert);
+            DatabaseBind(g_stmtQuoteInsert, 0, qSym);
+            DatabaseBind(g_stmtQuoteInsert, 1, bid);
+            DatabaseBind(g_stmtQuoteInsert, 2, ask);
+            DatabaseBind(g_stmtQuoteInsert, 3, spread);
+            DatabaseBind(g_stmtQuoteInsert, 4, now);
+            if(DatabaseRead(g_stmtQuoteInsert)) quoteCount++;
+         }
       }
       SafeCommit();
    }
