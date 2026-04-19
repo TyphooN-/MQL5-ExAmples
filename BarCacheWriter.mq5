@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.471"
+#property version   "1.472"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.472: Bound the gap-fill cold-start blob. When a gap-fill request lands on a key with existingCount==0 (cache empty for that SYM:TF), the v1.462 shallow check gated on `existingCount > 0` fell into IncrementalExportSymbolTF, which for a hasExisting=false row recursed into ExportSymbolTF(maxBars=0) — CopyRates from 1970.01.01 → now, unbounded. For a liquid equity on 1Min this yields ~1.37M bars → ~65MB TTBR blob. MT5's DatabaseRead on that single INSERT pushes the SQLite journal past its commit threshold and the transaction is auto-rolled back before the next SafeCommit reaches it — observable as 'cannot commit - no transaction is active' immediately after 'gap-fill OLN:1Min merged to 1368961 bars (req 2929, had 0)', followed by the entire symbol batch rolling back. Fix: shallow = (gapBars > existingCount) so the 0-cached case routes to ExportSymbolTF(symbol, tf, gapBars, ...) — bounded by the terminal's actual request — instead of the incremental path's unbounded fallback. Defense-in-depth: the hasExisting=false / bad-magic / bad-count returns inside IncrementalExportSymbolTF are now capped at MAX_BARS_PER_KEY (100K) so any other path that still lands there can't revive the 65MB write."
 #property description "v1.471: Stop the gap-fill→re-flag infinite loop. When IncrementalExportSymbolTF is called for a symbol whose broker side has no new bars since the last export (weekend/holiday stocks, quiet sessions), the function returned existingCount without writing anything — leaving bar_cache.timestamp frozen at its prior value. Mt5Sync's delta reader (get_cache_meta_since) saw the unchanged ts and skipped the row, the terminal's gap detector re-walked the bar_count mismatch, re-flagged the key, wrote a fresh demand.txt request, and the cycle repeated forever (observed: 1031 persistent requests, Mt5Sync reporting 0/0/999). Fix: advance bar_cache.timestamp via a pre-prepared row-level UPDATE (g_stmtBarTouchTs) on every appendCount<=0 branch, so 'freshly checked, nothing to add' propagates through Mt5Sync's ts filter and satisfies the terminal's freshness check. No blob rewrite, no metadata churn — just a single UPDATE bar_cache SET timestamp=?1 WHERE key=?2."
 #property description "v1.470: Fix 'cannot commit transaction - SQL statements in progress' on gap-fill + incremental paths. DatabaseRead on the shared g_stmtBarRead SELECT statement leaves the cursor in SQLITE_ROW state — SQLite then refuses any COMMIT on the connection until the statement is stepped to SQLITE_DONE or reset. GetCachedBarCount (v1.462+) and IncrementalExportSymbolTF both read one row and returned, so the batch COMMIT at the end of BatchSize symbols would fail whenever either path fired within the batch window (common: any gap-fill request, any incremental pull with an existing cache row). Explicitly DatabaseReset the cursor after extracting columns at all three g_stmtBarRead call sites. The data path was correct — the work completed — but the transaction rolled back, so the writes were silently discarded until the next cycle's full re-export."
 #property description "v1.469: Eliminate redundant metadata upserts. __SYMBOLS__ (7KB JSON of broker symbol names) and __SERVER__ (~60B server+company blob) were being rewritten with a fresh timestamp every 30s cycle. Nothing in the terminal reads __SYMBOLS__ — cached_mt5_symbols is derived from bar_cache keys — and __SERVER__ content is fixed after MT5 login. Mt5Sync's ts-based incremental merge treated the fresh ts as a change signal and re-merged the unchanged payload on every pass, costing ~7KB × 120 cycles/hour = ~840KB/hour of wasted target-side work per MT5 source. __SYMBOLS__ now uses two-tier dedup — fast skip on unchanged symCount within a 300s window (O(1), no SymbolName scan); slow path rebuilds the JSON and string-compares to the cached copy before upserting. __SERVER__ moves to a single OnInit write."
@@ -1554,7 +1555,12 @@ void ExportAll()
          {
             int existingCount = GetCachedBarCount(trackKey);
             int done;
-            bool shallow = (existingCount > 0 && gapBars > existingCount);
+            // v1.472: `gapBars > existingCount` also covers the existingCount==0
+            // case, routing a cold-start gap-fill to ExportSymbolTF(gapBars) instead
+            // of IncrementalExportSymbolTF — the latter would recurse into
+            // ExportSymbolTF(maxBars=0) (unbounded full history) when no row exists,
+            // producing multi-MB blobs that blow the SQLite commit threshold.
+            bool shallow = (gapBars > existingCount);
             if(shallow)
                done = ExportSymbolTF(symbol, g_timeframes[tf], gapBars, g_tfStrings[tf]);
             else
@@ -2047,7 +2053,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    string key = "mt5:" + symbol + ":" + tfStr;
 
    // Read existing blob from DB via pre-prepared statement
-   if(g_stmtBarRead == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, 0, tfStr);
+   if(g_stmtBarRead == INVALID_HANDLE) return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
    DatabaseReset(g_stmtBarRead);
    DatabaseBind(g_stmtBarRead, 0, key);
    uchar existingBlob[];
@@ -2063,11 +2069,11 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    DatabaseReset(g_stmtBarRead);
 
    if(!hasExisting)
-      return ExportSymbolTF(symbol, tf, 0, tfStr);
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
 
    // Verify TTBR magic
    if(existingBlob[0] != 'T' || existingBlob[1] != 'T' || existingBlob[2] != 'B' || existingBlob[3] != 'R')
-      return ExportSymbolTF(symbol, tf, 0, tfStr);
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
 
    int existingCount = (int)existingBlob[4]
                      | ((int)existingBlob[5] << 8)
@@ -2075,7 +2081,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
                      | ((int)existingBlob[7] << 24);
 
    if(existingCount <= 0 || ArraySize(existingBlob) < 8 + existingCount * 48)
-      return ExportSymbolTF(symbol, tf, 0, tfStr);
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
 
    // Find last existing bar timestamp
    ByteConv bc;
@@ -2101,7 +2107,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
       datetime gapStart = (datetime)(lastExistingTsMs / 1000) + 1;
       datetime gapEnd   = newRates[0].time - 1;
       if(gapEnd >= gapStart && Bars(symbol, tf, gapStart, gapEnd) > 0)
-         return ExportSymbolTF(symbol, tf, 0, tfStr);
+         return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
    }
 
    // v1.454: Reverse-order guard. If the newest fetched bar is strictly
@@ -2113,7 +2119,7 @@ int IncrementalExportSymbolTF(string symbol, ENUM_TIMEFRAMES tf, datetime lastSy
    // in the timestamp header. Force a full re-export to resync.
    long lastNewTsMs = (long)newRates[newCopied - 1].time * 1000;
    if(lastNewTsMs < lastExistingTsMs)
-      return ExportSymbolTF(symbol, tf, 0, tfStr);
+      return ExportSymbolTF(symbol, tf, MAX_BARS_PER_KEY, tfStr);
 
    // Find merge point
    int newStart = 0;
