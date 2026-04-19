@@ -23,8 +23,9 @@
  **/
 #property copyright "Copyright 2026 TyphooN (MarketWizardry.org)"
 #property link      "https://www.marketwizardry.org/"
-#property version   "1.464"
+#property version   "1.465"
 #property description "TTBR binary bar cache + specs + bid/ask to SQLite."
+#property description "v1.465: Per-(sym,TF) TF gate + O(1) hot-loop lookups. Replaces per-TF-global g_tfLastExportTime[9] with g_trackLastExport[] parallel to g_trackTimes[], so the 80% TF-period gate now fires per (symbol,TF) pair instead of globally per TF — previously the first symbol exported in a TF updated the global timer, gating ALL other symbols on that TF for the next period and starving the rotation queue. Adds g_gapFillMaxBarsByMWIdx[symCount*tfCount] + g_trackIdxByMWIdx[symCount*tfCount] flat-array caches populated by RebuildSlotCaches (runs alongside RebuildDemandIndexBitmap on demand.txt reload / symCount change). Hot loop goes from O(log N) on every (symbol,TF) to O(1). Tiered MaxBarsForTF: 1Min/5Min=50K, 15Min/30Min=30K, 1Hour=30K, 4Hour=20K, 1Day+=10K — gives backtest-useful low-TF history without blowing up H4/D1+ cache size."
 #property description "v1.464: RamdiskMode input (default true) — when the DB lives on /dev/shm (deploy_ramdisk.sh), switch to journal_mode=MEMORY + synchronous=OFF. Eliminates SQLite's DELETE-mode journal file create/truncate on every BEGIN/COMMIT, which under Wine translates to a stream of NtCreateFile/NtWriteFile/NtDeleteFile syscalls that dominate ExportAll throughput. Safe on tmpfs (reboot wipes the DB anyway). IntegrityCheck catches any blob corrupted by mid-COMMIT crash on next startup. Non-ramdisk users set RamdiskMode=false to keep DELETE journal + sync=NORMAL for durability."
 #property description "v1.463: Startup integrity exports broker's full available history (min(mt5Count, MaxBarsForTF)) instead of the old InitialBarCap=1000 fast-restart limit. Matches the terminal's integrity target; avoids the ~30 s window where v1.462's shallow-redirect fills the gap between a 1000-bar startup stub and the 100K target."
 #property description "v1.462: Shallow-cache redirect on gap-fill — when the terminal's gap-fill request asks for more bars than currently cached (integrity target: 100K for M1-H4, full history for D1/W1/MN1), route to ExportSymbolTF(maxBars=gapBars) instead of IncrementalExportSymbolTF. The incremental merge only APPENDS newer bars, so a fresh-but-shallow cache would otherwise never grow. New GetCachedBarCount helper reads the TTBR header for the decision."
@@ -122,9 +123,30 @@ int  g_trackFlushCounter = 0;
 #define FAIL_SENTINEL  1     // Sentinel timestamp: marks "permanently failed, stop retrying"
 #define MAX_BARS_PER_KEY 100000  // Hard cap: trim oldest bars during incremental merge if exceeded
 int g_cycleCount = 0;           // Counts ExportAll() calls for periodic maintenance
-// Per-TF last export time — skip TFs that can't have new bars since last check.
-// E.g., H4 bars only change every 4 hours, no point checking every 30 seconds.
-datetime g_tfLastExportTime[9]; // indexed by g_timeframes[] order
+
+// v1.465: Per-(sym,TF) last export time — replaces old per-TF-global
+// g_tfLastExportTime[9]. The global timer was a serialisation bug: the
+// first symbol exported in a TF updated g_tfLastExportTime[tf], gating
+// every other symbol on that same TF for the next 80% of the TF period.
+// On a 38-demand-symbol load, only ONE symbol per TF per gate window
+// could export without gap-fill bypass, starving the rotation queue
+// (symptom: terminal saw 42→44% cache coverage overnight and flatlined).
+// Now indexed in lockstep with g_trackKeys/g_trackTimes/g_trackFails/
+// g_trackDirty via trackIdx. Sorted alongside g_trackKeys in SortTrackArrays.
+datetime g_trackLastExport[];
+
+// v1.465: Flat-array O(1) caches indexed by (mwIdx * g_tfCount + tf).
+// g_gapFillMaxBarsByMWIdx replaces the binary-search GetGapFillMaxBars
+// call inside the ~900 symbol×TF inner-loop iterations per cycle.
+// g_trackIdxByMWIdx is lazy-populated: -1 means "not yet looked up",
+// positive means "resolved to this trackIdx". Populated on first hit
+// via GetTrackIndex and cached for the rest of the session (stable
+// because broker symbol ordering is stable within a session).
+// Rebuilt by RebuildSlotCaches — runs alongside RebuildDemandIndexBitmap
+// whenever demand.txt reloads or symCount changes.
+int g_gapFillMaxBarsByMWIdx[];
+int g_trackIdxByMWIdx[];
+int g_slotCacheSymCount = 0;     // symCount at last RebuildSlotCaches call
 
 // v1.447: Initial-burst mode — after /dev/shm clear or fresh install, rotation
 // would leave most symbols unpopulated for ~4 minutes. When OnInit detects an
@@ -205,14 +227,33 @@ int g_tfPeriods[9];
 // Cached ArraySize(g_timeframes) — avoids function call in the hot TF loop
 int g_tfCount = 9;
 
-// Max bars per timeframe — 0 = ALL available history from server (no limit)
-// Uses CopyRates(symbol, tf, D'1970.01.01', TimeCurrent(), rates) for full history
+// Max bars per timeframe. v1.465: tiered targets — low-TF gets deeper
+// history for algo backtesting, high-TF stays shallow (low-TF is where
+// the history matters). Must stay in lockstep with mt5_tf_spec in
+// native/src/app.rs so gap-detect's coverage target and BCW's fetch
+// ceiling agree.
+//   1Min   50K ≈ 35 days     — intraday backtests (scalping, short-term)
+//   5Min   50K ≈ 6 months    — swing backtests
+//   15Min  30K ≈ 10 months
+//   30Min  30K ≈ 20 months
+//   1Hour  30K ≈ 3.4 years   — positional backtests
+//   4Hour  20K ≈ 9 years     — long-horizon models
+//   1Day+  10K               — broker-served history ceiling
 int MaxBarsForTF(ENUM_TIMEFRAMES tf)
 {
-   // Cap all timeframes at 100,000 bars to prevent OOM and export hangs.
-   // 100K bars covers: M1=~69 days, M5=~347 days, M15=~1041 days,
-   // M30=~2083 days, H1=~11.4 years, H4=~45 years, D1/W1/MN1=all history
-   return 100000;
+   switch(tf)
+   {
+      case PERIOD_M1:  return 50000;
+      case PERIOD_M5:  return 50000;
+      case PERIOD_M15: return 30000;
+      case PERIOD_M30: return 30000;
+      case PERIOD_H1:  return 30000;
+      case PERIOD_H4:  return 20000;
+      case PERIOD_D1:  return 10000;
+      case PERIOD_W1:  return 10000;
+      case PERIOD_MN1: return 10000;
+   }
+   return 10000;
 }
 
 string TFToStr(ENUM_TIMEFRAMES tf)
@@ -281,28 +322,44 @@ void RebuildDemandIndexBitmap(int symCount)
    g_demandIdxSymCount = symCount;
 }
 
-// Sort tracking arrays by key (insertion sort — only runs when new keys added)
+// Sort tracking arrays by key (insertion sort — only runs when new keys added).
+// v1.465: sorts g_trackDirty and g_trackLastExport in lockstep — previously
+// g_trackDirty was untouched, which was latent corruption (a dirty flag for
+// key A would end up attached to key B after sort). g_trackIdxByMWIdx cache
+// is also invalidated on sort since previously-cached trackIdx values no
+// longer point at the same key.
 void SortTrackArrays()
 {
-   // Simple insertion sort — runs once after initial population, then never again
    for(int i = 1; i < g_trackCount; i++)
    {
-      string tmpKey = g_trackKeys[i];
-      datetime tmpTime = g_trackTimes[i];
-      int tmpFails = g_trackFails[i];
+      string   tmpKey     = g_trackKeys[i];
+      datetime tmpTime    = g_trackTimes[i];
+      int      tmpFails   = g_trackFails[i];
+      bool     tmpDirty   = g_trackDirty[i];
+      datetime tmpLastExp = g_trackLastExport[i];
       int j = i - 1;
       while(j >= 0 && StringCompare(g_trackKeys[j], tmpKey) > 0)
       {
-         g_trackKeys[j + 1] = g_trackKeys[j];
-         g_trackTimes[j + 1] = g_trackTimes[j];
-         g_trackFails[j + 1] = g_trackFails[j];
+         g_trackKeys[j + 1]        = g_trackKeys[j];
+         g_trackTimes[j + 1]       = g_trackTimes[j];
+         g_trackFails[j + 1]       = g_trackFails[j];
+         g_trackDirty[j + 1]       = g_trackDirty[j];
+         g_trackLastExport[j + 1]  = g_trackLastExport[j];
          j--;
       }
-      g_trackKeys[j + 1] = tmpKey;
-      g_trackTimes[j + 1] = tmpTime;
-      g_trackFails[j + 1] = tmpFails;
+      g_trackKeys[j + 1]       = tmpKey;
+      g_trackTimes[j + 1]      = tmpTime;
+      g_trackFails[j + 1]      = tmpFails;
+      g_trackDirty[j + 1]      = tmpDirty;
+      g_trackLastExport[j + 1] = tmpLastExp;
    }
    g_trackSorted = true;
+
+   // Cached trackIdx values are stale after a re-sort. Reset the slot
+   // cache to -1 so the next hot-loop lookup re-resolves via GetTrackIndex.
+   // Cheap: g_trackIdxByMWIdx is symCount*tfCount ints (~7.6K for 851 syms).
+   int slots = ArraySize(g_trackIdxByMWIdx);
+   for(int k = 0; k < slots; k++) g_trackIdxByMWIdx[k] = -1;
 }
 
 // ── TTBR Binary Bar Format ───────────────────────────────────────────────
@@ -378,10 +435,12 @@ int GetTrackIndex(string key)
    ArrayResize(g_trackTimes, g_trackCount, 1024);
    ArrayResize(g_trackFails, g_trackCount, 1024);
    ArrayResize(g_trackDirty, g_trackCount, 1024);
+   ArrayResize(g_trackLastExport, g_trackCount, 1024);
    g_trackKeys[g_trackCount - 1] = key;
    g_trackTimes[g_trackCount - 1] = 0;
    g_trackFails[g_trackCount - 1] = 0;
    g_trackDirty[g_trackCount - 1] = false;
+   g_trackLastExport[g_trackCount - 1] = 0;
    g_trackSorted = false;
    return g_trackCount - 1;
 }
@@ -461,10 +520,11 @@ void LoadTrackingFromDB()
    if(total > 0)
    {
       int resv = total + 256;
-      ArrayResize(g_trackKeys,  resv);
-      ArrayResize(g_trackTimes, resv);
-      ArrayResize(g_trackFails, resv);
-      ArrayResize(g_trackDirty, resv);
+      ArrayResize(g_trackKeys,       resv);
+      ArrayResize(g_trackTimes,      resv);
+      ArrayResize(g_trackFails,      resv);
+      ArrayResize(g_trackDirty,      resv);
+      ArrayResize(g_trackLastExport, resv);
    }
 
    int loaded = 0;
@@ -485,15 +545,17 @@ void LoadTrackingFromDB()
       if(idx >= ArraySize(g_trackKeys))
       {
          int grow = g_trackCount + 1024;
-         ArrayResize(g_trackKeys,  grow);
-         ArrayResize(g_trackTimes, grow);
-         ArrayResize(g_trackFails, grow);
-         ArrayResize(g_trackDirty, grow);
+         ArrayResize(g_trackKeys,       grow);
+         ArrayResize(g_trackTimes,      grow);
+         ArrayResize(g_trackFails,      grow);
+         ArrayResize(g_trackDirty,      grow);
+         ArrayResize(g_trackLastExport, grow);
       }
-      g_trackKeys[idx]  = key;
-      g_trackTimes[idx] = (datetime)ts;
-      g_trackFails[idx] = 0;
-      g_trackDirty[idx] = false;
+      g_trackKeys[idx]       = key;
+      g_trackTimes[idx]      = (datetime)ts;
+      g_trackFails[idx]      = 0;
+      g_trackDirty[idx]      = false;
+      g_trackLastExport[idx] = 0;
       loaded++;
    }
    DatabaseFinalize(req);
@@ -525,18 +587,6 @@ int BinarySearchGap(string symTf)
       else hi = mid - 1;
    }
    return -1;
-}
-
-// Look up a pending gap-fill request. Returns MAX_BARS if a request is
-// outstanding for this symbol:TF, 0 otherwise. v1.450: early-bail when
-// there is no active gap request at all — skips the binary search for
-// the ~900 calls per ExportAll cycle that happen in steady state.
-int GetGapFillMaxBars(string symTf)
-{
-   if(g_gapFillActive == 0) return 0;
-   int idx = BinarySearchGap(symTf);
-   if(idx < 0) return 0;
-   return g_gapFillMaxBars[idx];
 }
 
 // v1.462: Read the cached bar count for a key without decoding the whole
@@ -571,6 +621,65 @@ void ClearGapFill(string symTf)
    {
       g_gapFillMaxBars[idx] = 0;
       if(g_gapFillActive > 0) g_gapFillActive--;
+   }
+}
+
+// v1.465: O(1) variant — clears the slot cache alongside the sorted array.
+// Called from the hot ExportAll loop where we already have (mwIdx, tf) in
+// hand. Avoids re-building "SYMBOL:TF" strings + binary-searching for
+// every successful gap-fill. The sorted-array clear still happens so
+// subsequent BinarySearchGap calls (e.g. startup integrity) see a clean
+// state; g_gapFillActive decrement flows from the sorted clear.
+void ClearGapFillSlot(int mwIdx, int tf, string symTf)
+{
+   int flat = mwIdx * g_tfCount + tf;
+   if(flat >= 0 && flat < ArraySize(g_gapFillMaxBarsByMWIdx))
+      g_gapFillMaxBarsByMWIdx[flat] = 0;
+   ClearGapFill(symTf);
+}
+
+// v1.465: Rebuild the O(1) slot caches — paired with RebuildDemandIndexBitmap.
+// g_gapFillMaxBarsByMWIdx: flat symCount*tfCount int array. Each slot
+//   carries the pending gap-fill bar count for that (mwIdx, tf), 0 when
+//   no request is outstanding. Populated by walking g_gapFillKeys once
+//   and projecting each entry onto the two matching indices (symbol
+//   index in the MW table, TF index in g_timeframes).
+// g_trackIdxByMWIdx: flat symCount*tfCount int array, all -1 at rebuild.
+//   Lazily populated on first hot-loop hit via GetTrackIndex; cached
+//   for the rest of the session. Session-stable because MT5 symbol
+//   ordering (SymbolName index) doesn't churn mid-session.
+// Cost: O(symCount * tfCount + gapCount) — runs once at OnInit and again
+// whenever demand.txt reloads (every 2 cycles) or symCount changes.
+void RebuildSlotCaches(int symCount)
+{
+   if(symCount <= 0) return;
+   int slots = symCount * g_tfCount;
+   ArrayResize(g_gapFillMaxBarsByMWIdx, slots);
+   ArrayResize(g_trackIdxByMWIdx, slots);
+   ArrayInitialize(g_gapFillMaxBarsByMWIdx, 0);
+   for(int k = 0; k < slots; k++) g_trackIdxByMWIdx[k] = -1;
+   g_slotCacheSymCount = symCount;
+
+   if(g_gapFillCount <= 0 || g_demandCount <= 0) return;
+
+   // Build a symbol→mwIdx map by scanning MW symbols once. For each MW
+   // symbol that is in the demand list (O(log m) binary search), check
+   // if any gap-fill key starts with that symbol and match the TF half.
+   for(int i = 0; i < symCount; i++)
+   {
+      if(i < g_demandIdxSymCount && !g_isDemandIdx[i]) continue;
+      string sym = SymbolName(i, MarketWatchOnly);
+      if(StringLen(sym) == 0) continue;
+
+      // Probe each TF — gap-fill count is ≤ 1024 (SELF_HEAL_CAP) so a
+      // per-(sym,TF) binary search over g_gapFillKeys is cheap.
+      for(int tf = 0; tf < g_tfCount; tf++)
+      {
+         string symTf = sym + ":" + g_tfStrings[tf];
+         int gi = BinarySearchGap(symTf);
+         if(gi >= 0 && g_gapFillMaxBars[gi] > 0)
+            g_gapFillMaxBarsByMWIdx[i * g_tfCount + tf] = g_gapFillMaxBars[gi];
+      }
    }
 }
 
@@ -688,6 +797,7 @@ void LoadDemandFile(int symCount)
    }
 
    RebuildDemandIndexBitmap(symCount);
+   RebuildSlotCaches(symCount);
 
    PrintFormat("BarCacheWriter: demand.txt loaded from %s — %d symbols, %d gap-fills",
       path, g_demandCount, g_gapFillCount);
@@ -966,11 +1076,11 @@ int OnInit()
       ArrayResize(g_trackKeys, 0);
       ArrayResize(g_trackTimes, 0);
       ArrayResize(g_trackFails, 0);
+      ArrayResize(g_trackDirty, 0);
+      ArrayResize(g_trackLastExport, 0);
    }
    else
       LoadTrackingFromDB();
-
-   ArrayInitialize(g_tfLastExportTime, 0);
 
    // Startup integrity check: compare DB bar counts vs MT5 available bars for ALL symbols.
    // Runs once on startup — detects data loss from ramdisk migration or interrupted exports.
@@ -1255,8 +1365,13 @@ void ExportAll()
 
    // v1.443: Rebuild demand bitmap if symCount changed since last rebuild.
    // Cheap safety check — typical cost is zero (no rebuild needed).
+   // v1.465: the O(1) slot caches ride along — g_gapFillMaxBarsByMWIdx and
+   // g_trackIdxByMWIdx are both indexed by (mwIdx * g_tfCount + tf), so
+   // they must rebuild whenever symCount changes too.
    if(g_demandCount > 0 && g_demandIdxSymCount != symCount)
       RebuildDemandIndexBitmap(symCount);
+   if(g_slotCacheSymCount != symCount)
+      RebuildSlotCaches(symCount);
 
    for(int i = 0; i < symCount; i++)
    {
@@ -1297,34 +1412,39 @@ void ExportAll()
 
       for(int tf = 0; tf < g_tfCount; tf++)
       {
-         // v1.461: Check for pending gap-fill request BEFORE the TF-period
-         // gate. Previously the gate at line ~1250 would `continue` on any
-         // TF whose last-export was <80% of the TF period ago — which
-         // dropped the gap-fill path for the ENTIRE remainder of the loop
-         // body. Symptom: terminal keeps re-requesting the same ~256
-         // stale (SYMBOL:TF) pairs cycle after cycle because BCW's log
-         // reads "0 exported, N skipped" on any TF where the gating
-         // rejected the row (common for D1/W1/MN1 where elapsed is
-         // almost always <80% of 24h/1wk/1mo). GetGapFillMaxBars has an
-         // O(1) early-bail when g_gapFillActive == 0, so this adds no
-         // steady-state overhead.
-         string trackKey = symbol + ":" + g_tfStrings[tf];
-         int gapBars = GetGapFillMaxBars(trackKey);
+         // v1.465: O(1) gap-fill lookup via flat slot cache. Replaces the
+         // binary-search GetGapFillMaxBars call that ran once per (sym,TF)
+         // — ~900 calls/cycle. Also resolves the trackIdx through a
+         // session-lifetime lazy cache so GetTrackIndex's binary search
+         // fires at most once per (sym,TF) instead of once per cycle.
+         int slot = i * g_tfCount + tf;
+         int gapBars = (slot < ArraySize(g_gapFillMaxBarsByMWIdx))
+            ? g_gapFillMaxBarsByMWIdx[slot] : 0;
 
-         // TF gating: skip TFs that can't have new bars yet.
-         // If less than 80% of the TF period has elapsed since last export,
-         // a new bar can't have formed. 80% threshold allows for early checks
-         // near bar boundaries. This eliminates ~90% of CopyRates calls:
-         // at 30s intervals, only M1 is checked every cycle; M5 every ~4 min,
-         // H1 every ~48 min, D1 every ~19 hours, etc.
-         // v1.447: Skip gating during initial-burst — we want to populate
-         // every TF for demand symbols as fast as possible, not wait 4h for H4.
-         // v1.461: Skip gating when a gap-fill is pending so the request
-         // always gets serviced this cycle.
-         int tfPeriod = g_tfPeriods[tf];
-         if(gapBars == 0 && !g_initBurstActive && g_tfLastExportTime[tf] > 0 && tfPeriod > 0)
+         // Resolve trackIdx — cached for the session after first hit.
+         // GetTrackIndex may invalidate the cache (sort after append), so
+         // always refetch from the cache after the call to stay coherent.
+         string trackKey = symbol + ":" + g_tfStrings[tf];
+         int idx = -1;
+         if(slot < ArraySize(g_trackIdxByMWIdx))
+            idx = g_trackIdxByMWIdx[slot];
+         if(idx < 0 || idx >= g_trackCount)
          {
-            int elapsed = (int)(cycleNow - g_tfLastExportTime[tf]);
+            idx = GetTrackIndex(trackKey);
+            if(slot < ArraySize(g_trackIdxByMWIdx))
+               g_trackIdxByMWIdx[slot] = idx;
+         }
+
+         // v1.465: Per-(sym,TF) TF-period gate. Previously g_tfLastExportTime[tf]
+         // was a single datetime shared by all symbols on that TF — the first
+         // symbol's export stamped the global timer, gating EVERY other symbol
+         // for the next 80% of the TF period. With 38 demand pairs on 1Min, a
+         // single export starved 37 other symbols for 48s. g_trackLastExport[idx]
+         // is per-pair so every (sym,TF) rides its own gate independently.
+         int tfPeriod = g_tfPeriods[tf];
+         if(gapBars == 0 && !g_initBurstActive && g_trackLastExport[idx] > 0 && tfPeriod > 0)
+         {
+            int elapsed = (int)(cycleNow - g_trackLastExport[idx]);
             if(elapsed < (int)(tfPeriod * 0.8))
             {
                skipped++;
@@ -1332,32 +1452,10 @@ void ExportAll()
             }
          }
 
-         int idx = GetTrackIndex(trackKey);
-
          // v1.447: Gap-fill request from terminal — force a sync and clear
          // the request on success. Runs AHEAD of the normal track-time
          // comparison so a mid-session gap request always wins.
-         //
-         // v1.459: Route through IncrementalExportSymbolTF instead of a
-         // capped ExportSymbolTF. Previously `ExportSymbolTF(sym, tf, cap)`
-         // INSERT-OR-REPLACE'd the blob with only the last `cap` bars —
-         // on a non-empty cache this threw away older history (e.g. a
-         // 1500-bar gap request on a 50K-bar 1Hour cache kept 1500 and
-         // lost 48.5K bars). IncrementalExportSymbolTF merges ~200 fetched
-         // bars onto the existing blob for short gaps, and its v1.453
-         // hole-detection falls back to full re-export for long gaps —
-         // both paths preserve all existing bars.
-         //
-         // v1.462: Shallow-cache redirect — when the terminal's gap-fill
-         // request asks for MORE bars than currently cached (the
-         // integrity-coverage case: e.g. 5K D1 bars cached, terminal
-         // wants 100K for full history), route directly to ExportSymbolTF
-         // with the requested count. The incremental path only appends
-         // NEWER bars, so a fresh-but-shallow cache would otherwise
-         // never grow through normal operation. ExportSymbolTF at
-         // maxBars=gapBars fetches that many bars from the broker end
-         // (or all available, whichever is smaller) and re-seeds the
-         // blob, giving the terminal the deep history it asked for.
+         // v1.459: merge-instead-of-replace; v1.462: shallow-cache redirect.
          if(gapBars > 0)
          {
             int existingCount = GetCachedBarCount(trackKey);
@@ -1372,14 +1470,14 @@ void ExportAll()
                exported++;
                totalBars += done;
                g_trackFails[idx] = 0;
-               g_tfLastExportTime[tf] = cycleNow;
+               g_trackLastExport[idx] = cycleNow;
                MqlRates gapLast[];
                if(CopyRates(symbol, g_timeframes[tf], 0, 1, gapLast) == 1)
                {
                   g_trackTimes[idx] = gapLast[0].time;
                   g_trackDirty[idx] = true;
                }
-               ClearGapFill(trackKey);
+               ClearGapFillSlot(i, tf, trackKey);
                PrintFormat("BarCacheWriter: gap-fill %s — %s to %d bars (req %d, had %d)",
                   trackKey, shallow ? "re-seeded" : "merged", done, gapBars, existingCount);
                continue;
@@ -1393,13 +1491,11 @@ void ExportAll()
          // Never synced — try to export whatever is locally available (non-blocking)
          if(g_trackTimes[idx] == 0)
          {
-            // Give up after MAX_CONSEC_FAILS — broker doesn't have this history
             if(g_trackFails[idx] >= MAX_CONSEC_FAILS)
             {
                skipped++;
                continue;
             }
-            // Fast pre-check: if broker has zero bars locally, skip without wasting a retry slot
             if(Bars(symbol, g_timeframes[tf]) == 0)
             {
                g_trackFails[idx]++;
@@ -1411,8 +1507,6 @@ void ExportAll()
                }
                continue;
             }
-            // Unlimited: maxBars=0 fetches ALL available history from server
-            // Monitor MT5 memory if OOM occurs on M1 with millions of bars
             int bars = ExportSymbolTF(symbol, g_timeframes[tf], MaxBarsForTF(g_timeframes[tf]), g_tfStrings[tf]);
 
             if(bars > 0)
@@ -1420,11 +1514,11 @@ void ExportAll()
                exported++;
                totalBars += bars;
                g_trackFails[idx] = 0;
-               g_tfLastExportTime[tf] = cycleNow;
+               g_trackLastExport[idx] = cycleNow;
                if(gotLast == 1)
                {
                   g_trackTimes[idx] = lastRate[0].time;
-                  g_trackDirty[idx] = true; // v1.443: defer DB persistence to bulk flush
+                  g_trackDirty[idx] = true;
                }
             }
             else
@@ -1432,7 +1526,6 @@ void ExportAll()
                g_trackFails[idx]++;
                if(g_trackFails[idx] >= MAX_CONSEC_FAILS)
                {
-                  // Mark as permanently failed — stop retrying
                   g_trackTimes[idx] = (datetime)FAIL_SENTINEL;
                   SaveTrackTime(trackKey, (datetime)FAIL_SENTINEL);
                   PrintFormat("BarCacheWriter: giving up on %s after %d failures", trackKey, MAX_CONSEC_FAILS);
@@ -1448,19 +1541,16 @@ void ExportAll()
             continue;
          }
 
-         // Incremental sync: only fetch bars SINCE last sync, merge with existing DB blob.
-         // Instead of re-exporting 100K bars, fetches ~200 recent bars and appends to existing data.
-         // Preserves full history while only transferring the delta.
          int bars = IncrementalExportSymbolTF(symbol, g_timeframes[tf], g_trackTimes[idx], g_tfStrings[tf], g_tfPeriods[tf]);
          if(bars > 0)
          {
             exported++;
             totalBars += bars;
-            g_tfLastExportTime[tf] = cycleNow; // update TF gate timer
+            g_trackLastExport[idx] = cycleNow;
             if(gotLast == 1)
             {
                g_trackTimes[idx] = lastRate[0].time;
-               g_trackDirty[idx] = true; // v1.443: defer DB persistence to bulk flush
+               g_trackDirty[idx] = true;
             }
          }
       }
